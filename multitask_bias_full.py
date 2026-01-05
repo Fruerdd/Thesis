@@ -7,6 +7,10 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 
+
+from tqdm.auto import tqdm
+import time
+
 import numpy as np
 import pandas as pd
 
@@ -61,15 +65,20 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+
 # speed/quality knobs
-MAX_SAMPLES_HEADLINES = 150_000
-MAX_SAMPLES_ARTICLES  = 150_000
+MAX_SAMPLES_HEADLINES = 100_000
+MAX_SAMPLES_ARTICLES  = 100_000
 VAL_SIZE = 0.05
 
-MAX_LENGTH = 256          # tokens per chunk
-MAX_CHUNKS = 4            # chunks per document (hierarchical)
+MAX_LENGTH = 192          # tokens per chunk
+MAX_CHUNKS = 2            # chunks per document (hierarchical)
 BATCH_SIZE = 16 if DEVICE == "cuda" else 8
 EPOCHS = 1                # increase later to 2–3
+
+MAX_TOTAL_TOKENS = (MAX_LENGTH - 2) * MAX_CHUNKS  # сколько токенов мы максимум используем
+
 
 LR = 2e-5
 WARMUP_RATIO = 0.06
@@ -178,23 +187,33 @@ def extract_features(text: str) -> np.ndarray:
 
 # -------------------- TOKENIZATION + HIERARCHICAL CHUNKING --------------------
 def encode_to_chunks(tokenizer, text: str, max_length: int, max_chunks: int):
-    # make chunks without truncation, then cap at max_chunks
+    """
+    FIX:
+    - truncation=True + max_length=MAX_TOTAL_TOKENS so tokenizer never processes the whole huge article.
+    - This removes the "infinite loop" feeling on long texts.
+    """
+    text = "" if text is None else str(text)
+
+    chunk_size = max_length - 2
+    max_total = chunk_size * max_chunks
+
     enc = tokenizer(
         text,
         add_special_tokens=False,
-        truncation=False,
+        truncation=True,            # ✅ IMPORTANT
+        max_length=max_total,       # ✅ IMPORTANT
         return_attention_mask=False,
     )
+
     ids = enc["input_ids"]
     cls_id = tokenizer.cls_token_id
     sep_id = tokenizer.sep_token_id
     pad_id = tokenizer.pad_token_id
 
-    chunk_size = max_length - 2
     chunks = []
     for i in range(0, len(ids), chunk_size):
-        seg = ids[i:i+chunk_size]
-        if not seg:
+        seg = ids[i:i + chunk_size]
+        if len(seg) == 0:
             break
         chunk = [cls_id] + seg + [sep_id]
         chunks.append(chunk)
@@ -204,28 +223,24 @@ def encode_to_chunks(tokenizer, text: str, max_length: int, max_chunks: int):
     if not chunks:
         chunks = [[cls_id, sep_id]]
 
-    # pad each chunk to max_length
-    padded = []
-    attn = []
-    chunk_mask = []
+    padded, attn, chunk_mask = [], [], []
     for c in chunks:
-        cm = 1
         if len(c) < max_length:
             c = c + [pad_id] * (max_length - len(c))
         else:
             c = c[:max_length]
-        a = [1 if tok != pad_id else 0 for tok in c]
+        a = [0 if tok == pad_id else 1 for tok in c]
         padded.append(c)
         attn.append(a)
-        chunk_mask.append(cm)
+        chunk_mask.append(1)
 
-    # pad number of chunks to max_chunks
     while len(padded) < max_chunks:
-        padded.append([pad_id]*max_length)
-        attn.append([0]*max_length)
+        padded.append([pad_id] * max_length)
+        attn.append([0] * max_length)
         chunk_mask.append(0)
 
     return padded, attn, chunk_mask
+
 
 
 @dataclass
@@ -448,8 +463,37 @@ def build_dataset(tokenizer):
             "feats": feats,
         }
 
-    train_ds = train_ds.map(map_fn)
-    val_ds = val_ds.map(map_fn)
+    def map_fn(batch):
+        texts = batch["text"]
+        feats_list, ids_list, att_list, cm_list = [], [], [], []
+
+        for t in texts:
+            t = "" if t is None else str(t)
+            feats_list.append(extract_features(t).tolist())
+            ids, att, cm = encode_to_chunks(tokenizer, t, MAX_LENGTH, MAX_CHUNKS)
+            ids_list.append(ids)
+            att_list.append(att)
+            cm_list.append(cm)
+
+        return {
+            "input_ids_chunks": ids_list,
+            "attention_mask_chunks": att_list,
+            "chunk_mask": cm_list,
+            "feats": feats_list,
+        }
+
+    train_ds = train_ds.map(
+        map_fn,
+        batched=True,
+        batch_size=64,  # можешь 128 на RTX 3060 Ti
+        load_from_cache_file=False,  # ✅ чтобы не казалось что оно "крутится"
+    )
+    val_ds = val_ds.map(
+        map_fn,
+        batched=True,
+        batch_size=64,
+        load_from_cache_file=False,
+    )
 
     meta = {
         "lean_labels": LEAN_CANON,
@@ -530,6 +574,18 @@ def run_dapt(tokenizer, steps: int = 5000, mlm_prob: float = 0.15) -> str:
 # -------------------- TRAIN LOOP (MULTITASK + DANN) --------------------
 def set_seed(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+def masked_ce_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
+    """
+    Cross-entropy only on rows where targets != ignore_index.
+    If a batch has no valid targets (all ignored), returns 0.0 (not NaN).
+    """
+    targets = targets.to(logits.device)
+    mask = targets.ne(ignore_index)
+
+    if mask.sum().item() == 0:
+        return torch.zeros((), device=logits.device)  # scalar 0.0 on the right device
+
+    return F.cross_entropy(logits[mask], targets[mask])
 
 def evaluate(model: HierMultiTaskBiasModel, dl: DataLoader) -> Dict[str, float]:
     model.eval()
@@ -538,15 +594,14 @@ def evaluate(model: HierMultiTaskBiasModel, dl: DataLoader) -> Dict[str, float]:
     dom_p, dom_y = [], []
     losses = []
 
-    ce = nn.CrossEntropyLoss(ignore_index=-100)
 
     with torch.no_grad():
         for batch in dl:
             out = model(batch, grl_lambda=1.0)
 
-            l_lean = ce(out["logits_lean"], batch.y_lean.to(DEVICE))
-            l_int  = ce(out["logits_int"], batch.y_int.to(DEVICE))
-            l_dom  = ce(out["logits_dom"], batch.domain.to(DEVICE))
+            l_lean = masked_ce_loss(out["logits_lean"], batch.y_lean, ignore_index=-100)
+            l_int = masked_ce_loss(out["logits_int"], batch.y_int, ignore_index=-100)
+            l_dom = F.cross_entropy(out["logits_dom"], batch.domain.to(DEVICE))
 
             loss = (W_LEAN*l_lean) + (W_INTENSITY*l_int) + (W_DOMAIN*l_dom)
             losses.append(loss.item())
@@ -586,11 +641,19 @@ def train_one(seed: int, encoder_path: str, run_name: str):
     set_seed(seed)
 
     tok = AutoTokenizer.from_pretrained(encoder_path)
-    train_ds, val_ds = build_dataset(tok)
 
+    print("[1/5] Building datasets...")
+    t0 = time.time()
+    train_ds, val_ds = build_dataset(tok)
+    print(f"[1/5] Done. train={len(train_ds):,} val={len(val_ds):,} in {time.time() - t0:.1f}s")
+
+    print("[2/5] Building dataloaders...")
     collator = HierCollator(tok, MAX_LENGTH, MAX_CHUNKS)
-    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collator)
-    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collator, num_workers=0,
+                          pin_memory=(DEVICE == "cuda"))
+    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator, num_workers=0,
+                        pin_memory=(DEVICE == "cuda"))
+    print(f"[2/5] Done. steps/epoch={len(train_dl):,}")
 
     feat_dim = len(train_ds[0]["feats"])
     model = HierMultiTaskBiasModel(
@@ -612,20 +675,50 @@ def train_one(seed: int, encoder_path: str, run_name: str):
     model.train()
     step = 0
 
+    print("[3/5] Loading model...")
+    t0 = time.time()
+
+    feat_dim = len(train_ds[0]["feats"])
+    model = HierMultiTaskBiasModel(
+        encoder_name=encoder_path,
+        feat_dim=feat_dim,
+        n_lean=len(LEAN_CANON),
+        n_int=len(INT_CANON),
+        n_domain=2,
+    ).to(DEVICE)
+
+    print(f"[3/5] Done. in {time.time() - t0:.1f}s")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=LR)
+    total_steps = EPOCHS * len(train_dl)
+    sched = get_linear_schedule_with_warmup(
+        opt,
+        num_warmup_steps=int(total_steps * WARMUP_RATIO),
+        num_training_steps=total_steps
+    )
+
+    ce_lean = nn.CrossEntropyLoss(ignore_index=-100)
+    ce_int = nn.CrossEntropyLoss(ignore_index=-100)
+    ce_dom = nn.CrossEntropyLoss()
+
+    print("[4/5] Starting training...")
+    model.train()
+    step = 0
+
     for epoch in range(1, EPOCHS + 1):
-        for batch in train_dl:
+        pbar = tqdm(train_dl, desc=f"train epoch {epoch}/{EPOCHS}", dynamic_ncols=True)
+        for batch in pbar:
             step += 1
 
-            # schedule GRL strength from 0 -> 1 (common DANN trick)
             p = step / max(total_steps, 1)
             grl_lambda = float(2.0 / (1.0 + math.exp(-10 * p)) - 1.0)
 
             out = model(batch, grl_lambda=grl_lambda)
-            l_lean = ce_lean(out["logits_lean"], batch.y_lean.to(DEVICE))
-            l_int  = ce_int(out["logits_int"], batch.y_int.to(DEVICE))
-            l_dom  = ce_dom(out["logits_dom"], batch.domain.to(DEVICE))
+            l_lean = masked_ce_loss(out["logits_lean"], batch.y_lean, ignore_index=-100)
+            l_int = masked_ce_loss(out["logits_int"], batch.y_int, ignore_index=-100)
+            l_dom = F.cross_entropy(out["logits_dom"], batch.domain.to(DEVICE))
 
-            loss = (W_LEAN*l_lean) + (W_INTENSITY*l_int) + (W_DOMAIN*l_dom)
+            loss = (W_LEAN * l_lean) + (W_INTENSITY * l_int) + (W_DOMAIN * l_dom)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -633,12 +726,19 @@ def train_one(seed: int, encoder_path: str, run_name: str):
             sched.step()
             opt.zero_grad(set_to_none=True)
 
-            if step % 200 == 0:
-                print(f"[train] step {step}/{total_steps} loss={loss.item():.4f} "
-                      f"(lean={l_lean.item():.3f} int={l_int.item():.3f} dom={l_dom.item():.3f}) grl={grl_lambda:.2f}")
+            # ✅ обновляем прогресс каждую итерацию (видно, что не висит)
+            pbar.set_postfix({
+                "loss": f"{loss.item():.3f}",
+                "lean": f"{l_lean.item():.2f}",
+                "int": f"{l_int.item():.2f}",
+                "dom": f"{l_dom.item():.2f}",
+                "grl": f"{grl_lambda:.2f}",
+            })
 
         metrics = evaluate(model, val_dl)
         print(f"[eval][epoch {epoch}] {metrics}")
+
+    print("[5/5] Training finished.")
 
     save_dir = OUT_DIR / run_name
     save_dir.mkdir(parents=True, exist_ok=True)
