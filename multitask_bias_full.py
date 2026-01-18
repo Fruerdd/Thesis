@@ -171,11 +171,7 @@ def extract_features(text: str) -> np.ndarray:
     return feats
 
 def encode_to_chunks(tokenizer, text: str, max_length: int, max_chunks: int):
-    """
-    FIX:
-    - truncation=True + max_length=MAX_TOTAL_TOKENS so tokenizer never processes the whole huge article.
-    - This removes the "infinite loop" feeling on long texts.
-    """
+
     text = "" if text is None else str(text)
 
     chunk_size = max_length - 2
@@ -184,8 +180,8 @@ def encode_to_chunks(tokenizer, text: str, max_length: int, max_chunks: int):
     enc = tokenizer(
         text,
         add_special_tokens=False,
-        truncation=True,            # ✅ IMPORTANT
-        max_length=max_total,       # ✅ IMPORTANT
+        truncation=True,
+        max_length=max_total,
         return_attention_mask=False,
     )
 
@@ -760,46 +756,53 @@ def predict(text: str, model_dirs: List[str], encoder_path: str, threshold_non_c
     }
 
 
-def explain_ig(text: str, model_dir: str, encoder_path: str, target: str = "lean", target_class: Optional[int] = None):
 
+def explain_ig(text: str, model_dir: str, encoder_path: str, target: str = "lean", target_class: Optional[int] = None):
     if not _HAS_CAPTUM:
         raise RuntimeError("captum not installed. pip install captum")
+
+    from captum.attr import IntegratedGradients
 
     tok, model = load_model(model_dir, encoder_path)
     model.eval()
 
     ids, att, cm = encode_to_chunks(tok, text, MAX_LENGTH, MAX_CHUNKS)
-    first_ids = torch.tensor([ids[0]], dtype=torch.long).to(DEVICE)      # (1, L)
-    first_att = torch.tensor([att[0]], dtype=torch.long).to(DEVICE)      # (1, L)
+    first_ids = torch.tensor([ids[0]], dtype=torch.long).to(DEVICE)  # (1, L)
+    first_att = torch.tensor([att[0]], dtype=torch.long).to(DEVICE)  # (1, L)
 
     emb_layer = model.encoder.embeddings.word_embeddings
+    inp_emb = emb_layer(first_ids)  # (1, L, H)
 
     def forward_emb(embeddings):
-        out = model.encoder(inputs_embeds=embeddings, attention_mask=first_att)
-        cls = out.last_hidden_state[:, 0, :]  # (1, H)
-        feats = torch.zeros((1, 12), device=DEVICE)
+        N = embeddings.size(0)
+
+        attn = first_att.expand(N, -1)  # (N, L)
+
+        out = model.encoder(inputs_embeds=embeddings, attention_mask=attn)
+        cls = out.last_hidden_state[:, 0, :]  # (N, H)
+
+        # Make feats match batch size N
+        feats = torch.zeros((N, 12), device=embeddings.device)
         f = model.feat_proj(feats)
         g = model.gate(torch.cat([cls, f], dim=-1))
         fused = model.norm(g * cls + (1 - g) * f)
 
-        if target == "lean":
-            logits = model.head_lean(fused)
-        else:
-            logits = model.head_int(fused)
+        logits = model.head_lean(fused) if target == "lean" else model.head_int(fused)
         return logits
 
-    inp_emb = emb_layer(first_ids)
+    with torch.no_grad():
+        logits0 = forward_emb(inp_emb)
+        if target_class is None:
+            target_class = int(torch.argmax(logits0, dim=-1).item())
 
-    lig = LayerIntegratedGradients(forward_emb, emb_layer)
-    if target_class is None:
-        logits = forward_emb(inp_emb)
-        target_class = int(torch.argmax(logits, dim=-1).item())
+    ig = IntegratedGradients(forward_emb)
 
-    attributions, _ = lig.attribute(
+    baseline = torch.zeros_like(inp_emb)
+    attributions = ig.attribute(
         inputs=inp_emb,
+        baselines=baseline,
         target=target_class,
         n_steps=24,
-        return_convergence_delta=True,
     )
 
     scores = attributions.sum(dim=-1).squeeze(0).detach().cpu().numpy()  # (L,)
@@ -808,6 +811,8 @@ def explain_ig(text: str, model_dir: str, encoder_path: str, target: str = "lean
     items = [(t, float(s)) for t, s in zip(toks, scores) if t != tok.pad_token]
     items.sort(key=lambda x: abs(x[1]), reverse=True)
     return {"target": target, "target_class": int(target_class), "top_tokens": items[:25]}
+
+
 
 
 def main():
