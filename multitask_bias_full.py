@@ -78,7 +78,7 @@ WARMUP_RATIO = 0.06
 
 W_LEAN = 1.0
 W_INTENSITY = 1.0
-W_DOMAIN = 0.2
+W_DOMAIN = 0.05 # decreased from 0.2 to 0.05
 
 DOMAIN_HEADLINES = 0
 DOMAIN_ARTICLES  = 1
@@ -614,16 +614,7 @@ def train_one(seed: int, encoder_path: str, run_name: str):
         n_domain=2,
     ).to(DEVICE)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=LR)
-    total_steps = EPOCHS * len(train_dl)
-    sched = get_linear_schedule_with_warmup(opt, num_warmup_steps=int(total_steps*WARMUP_RATIO), num_training_steps=total_steps)
-
-    ce_lean = nn.CrossEntropyLoss(ignore_index=-100)
-    ce_int  = nn.CrossEntropyLoss(ignore_index=-100)
-    ce_dom  = nn.CrossEntropyLoss()
-
     model.train()
-    step = 0
 
     print("[3/5] Loading model...")
     t0 = time.time()
@@ -646,10 +637,6 @@ def train_one(seed: int, encoder_path: str, run_name: str):
         num_warmup_steps=int(total_steps * WARMUP_RATIO),
         num_training_steps=total_steps
     )
-
-    ce_lean = nn.CrossEntropyLoss(ignore_index=-100)
-    ce_int = nn.CrossEntropyLoss(ignore_index=-100)
-    ce_dom = nn.CrossEntropyLoss()
 
     print("[4/5] Starting training...")
     model.train()
