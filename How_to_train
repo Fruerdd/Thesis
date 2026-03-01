@@ -1,0 +1,57 @@
+V2 SEQUENCE OF COMMANDS
+
+1) python train_bias_v2.py --train_teacher
+2) python train_bias_v2.py --pseudo_label_articles
+3) python train_bias_v2.py --train_student
+
+
+HOW TO USE:
+
+1) Analyze plain text
+python analyze_cli.py \
+  --db "postgresql+psycopg2://user:pass@localhost:5432/biasdb" \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --source "BBC" \
+  --text "Your article text here..."
+
+2) Analyze URL
+python analyze_cli.py \
+  --db "postgresql+psycopg2://user:pass@localhost:5432/biasdb" \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --source "BBC" \
+  --url "https://example.com/news/article"
+
+DB_URL = jdbc:postgresql://localhost:5432/thesis
+
+python analyze_cli.py \
+  --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --source "BBC" \
+  --text "The political temperature is really heating up on day two of these depositions.
+
+Before the start, we heard from both Republicans and Democrats on the committee and their description of the former Secretary of State Hillary Clinton’s demeanour and credibility couldn’t have been more different.
+
+Republican representative Nancy Mace claimed Clinton was unhinged at one point in the deposition.
+
+But Democrats, in disbelief, said that was beyond a mischaracterisation.
+
+The public will be able to decide for themselves when the video is eventually made public.
+
+Today’s deposition is expected to be far more tense and to last a lot longer.
+
+Unlike his wife, former President Bill Clinton has several documented trips and interactions with Epstein when he was trying to set up his charitable work post presidency.
+
+It was before Epstein was under federal investigation for sex trafficking and Clinton says he regrets his association with him and never knew of his crimes at the time.
+
+Democrats say they will ask Clinton hard questions, but that the wrong president is giving evidence today."
+
+python analyze_cli.py \
+  --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --source "BBC" \
+  --url "https://www.bbc.com/news/live/c4g2w7eyzkxt?post=asset%3A7af291ca-e81b-4662-83de-fe1910098efb#post"
+
