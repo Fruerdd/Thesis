@@ -1,3 +1,15 @@
+ROC curve creation:
+python roc_eval.py \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --split both
+
+python roc_eval.py \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --split train
+
+
 V2 SEQUENCE OF COMMANDS
 
 1) python train_bias_v2.py --train_teacher
@@ -52,6 +64,6 @@ python analyze_cli.py \
   --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
   --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
   --encoder "bert-base-uncased" \
-  --source "BBC" \
-  --url "https://www.bbc.com/news/live/c4g2w7eyzkxt?post=asset%3A7af291ca-e81b-4662-83de-fe1910098efb#post"
+  --source "Time" \
+  --url "https://time.com/7382464/trump-starmer-conflict-uk-us-relationship-iran-war/"
 
