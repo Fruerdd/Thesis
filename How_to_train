@@ -17,7 +17,35 @@ V2 SEQUENCE OF COMMANDS
 3) python train_bias_v2.py --train_student
 
 
+Advanced training on centered political bias
+
+python finetune_lean_lrll.py \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --out_dir "./bias_system_v2/student_finetuned_lrll_v2" \
+  --epochs 2 \
+  --batch_size 8 \
+  --max_length 192 \
+  --max_chunks 3 \
+  --replay_size 12000 \
+  --lrll_repeat 4
+
 HOW TO USE:
+
+
+Advanced model use:
+
+python test_json_folders.py \
+  --datasets_root "DataSets" \
+  --model_dir "./bias_system_v2/student_finetuned_lrll" \
+  --encoder "bert-base-uncased" \
+  --out_dir "batch_outputs_lrll" \
+  --max_length 192 \
+  --max_chunks 3 \
+  --batch_size 16
+
+
+General model:
 
 1) Analyze plain text
 python analyze_cli.py \
