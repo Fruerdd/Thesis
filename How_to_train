@@ -16,6 +16,14 @@ V2 SEQUENCE OF COMMANDS
 2) python train_bias_v2.py --pseudo_label_articles
 3) python train_bias_v2.py --train_student
 
+V3 SEQUENCE OF COMMANDS
+
+1) python train_bias_v3.py --train_teacher --encoder bert-base-uncased
+2) python train_bias_v3.py --clear_pseudo_cache
+3) python train_bias_v3.py --pseudo_label_articles --encoder bert-base-uncased
+4) python train_bias_v3.py --train_student --encoder bert-base-uncased
+5) python train_bias_v3.py --predict "Your article text here" --predict_mode combined --predict_source "CNN" --encoder bert-base-uncased
+
 TEST datasets use:
 
 python eval_political_bias_local.py --csv "data_test/political_bias.csv" --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" --encoder "bert-base-uncased" --max_length 128 --max_chunks 3 --batch_size 32 --out_png "political_bias_confusion_matrix.png"
