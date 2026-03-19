@@ -16,6 +16,12 @@ V2 SEQUENCE OF COMMANDS
 2) python train_bias_v2.py --pseudo_label_articles
 3) python train_bias_v2.py --train_student
 
+TEST datasets use:
+
+python eval_political_bias_local.py --csv "data_test/political_bias.csv" --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" --encoder "bert-base-uncased" --max_length 128 --max_chunks 3 --batch_size 32 --out_png "political_bias_confusion_matrix.png"
+python batch_eval_datasets.py --datasets_root "DataSets" --model_dir "./bias_system_v2/student_mt_softlean_seed42" --out_dir "batch_outputs" --limit 100
+
+python batch_eval_datasets.py --datasets_root "DataSets" --model_dir "./bias_system_v2/student_mt_softlean_seed42" --encoder "bert-base-uncased" --out_dir "batch_outputs" --max_length 128 --max_chunks 3 --batch_size 16 --threshold 0.5
 
 Advanced training on centered political bias
 

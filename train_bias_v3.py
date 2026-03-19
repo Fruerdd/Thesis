@@ -5,7 +5,6 @@ import json
 import random
 import argparse
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -19,12 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset as TorchDataset
-from torch.cuda.amp import GradScaler
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
-
-from datasets import Dataset as HFDataset
 
 from transformers import (
     AutoTokenizer,
@@ -58,24 +54,31 @@ if DEVICE == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-SCALER = GradScaler(enabled=(DEVICE == "cuda"))
+try:
+    from torch.amp import GradScaler as _GradScaler
+
+    def make_grad_scaler():
+        return _GradScaler("cuda", enabled=(DEVICE == "cuda"))
+except Exception:
+    from torch.cuda.amp import GradScaler as _GradScaler
+
+    def make_grad_scaler():
+        return _GradScaler(enabled=(DEVICE == "cuda"))
+
+SCALER = make_grad_scaler()
 
 # ============================================================
 # PATHS
 # ============================================================
 DATA_DIR = Path("data")
+PREP_DIR = Path("data_prepared")
 
-FILE_ALLSIDES_HEADLINES = DATA_DIR / "allsides_balanced_news_headlines-texts.csv"
+FILE_COMBINED_LEAN = PREP_DIR / "combined_lean_dataset_balanced_15000.csv"
 FILE_NEWSMEDIABIAS = DATA_DIR / "newsmediabias-full.csv"
-FILE_POLITICAL_BIAS = DATA_DIR / "Political_Bias.csv"
-FILE_POLITICAL_BIAS_UPDATE = DATA_DIR / "Political_Bias_Update.csv"
 FILE_ALLSIDES_SOURCES = DATA_DIR / "allsides.csv"
 
 OUT_DIR = Path("./bias_system_v3")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-HEDGES_CACHE = OUT_DIR / "hedges_words.txt"
-HEDGES_URL = "https://raw.githubusercontent.com/words/hedges/master/data.txt"
 
 # ============================================================
 # CONFIG
@@ -91,22 +94,22 @@ INFER_BATCH = 64 if DEVICE == "cuda" else 16
 NUM_WORKERS = 0
 
 EPOCHS_TEACHER = 2
-EPOCHS_STUDENT = 3
+EPOCHS_STUDENT = 2
 
 LR = 2e-5
 WARMUP_RATIO = 0.06
 
-W_LEAN_HARD = 1.5
-W_LEAN_SOFT = 0.6
+W_LEAN_HARD = 2.0
+W_LEAN_SOFT = 0.08
 W_INTENSITY = 1.0
 W_DOMAIN = 0.0
 
 DOMAIN_LEAN = 0
 DOMAIN_INTENSITY = 1
 
-PSEUDO_MIN_CONF = 0.40
-SOURCE_PRIOR_ALPHA = 0.12
-SOURCE_PRIOR_MARGIN = 0.08
+PSEUDO_MIN_CONF = 0.55
+SOURCE_PRIOR_ALPHA = 0.10
+SOURCE_PRIOR_MARGIN = 0.06
 
 BREAK_EVERY_HOURS = 3
 BREAK_DURATION_MIN = 15
@@ -158,38 +161,24 @@ def norm_intensity(x: Any) -> Optional[str]:
 
 
 # ============================================================
-# WORD LISTS
+# EMBEDDED WORD LISTS
 # ============================================================
 def normalize_term(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip().lower())
+    return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
-def load_hedges() -> set:
-    if HEDGES_CACHE.exists():
-        return {
-            normalize_term(line)
-            for line in HEDGES_CACHE.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
-
-    try:
-        with urllib.request.urlopen(HEDGES_URL, timeout=20) as resp:
-            text = resp.read().decode("utf-8")
-        HEDGES_CACHE.write_text(text, encoding="utf-8")
-        return {
-            normalize_term(line)
-            for line in text.splitlines()
-            if line.strip()
-        }
-    except Exception:
-        # safe fallback
-        return {
-            "may", "might", "could", "possibly", "perhaps", "apparently",
-            "reportedly", "allegedly", "seems", "suggests", "claimed"
-        }
-
-
-HEDGES = load_hedges()
+HEDGES = {
+    "allegedly", "apparently", "arguably", "assume", "assumed", "assumes",
+    "could", "doubtful", "estimated", "fairly", "generally", "likely",
+    "mainly", "may", "maybe", "might", "mostly", "often", "perhaps",
+    "plausible", "plausibly", "possible", "possibly", "postulated",
+    "presumably", "probable", "probably", "purported", "purportedly",
+    "quite", "rather", "relatively", "reportedly", "rumored", "seem",
+    "seemed", "seemingly", "seems", "somewhat", "suggest", "suggested",
+    "suggesting", "suggests", "supposedly", "typically", "uncertain",
+    "unclear", "usually", "virtually", "appears", "claimed", "claims",
+    "sources say", "it seems", "in part", "sort of", "kind of",
+}
 
 INTENSIFIERS = {
     "very", "extremely", "clearly", "obviously", "undeniably", "shocking",
@@ -208,11 +197,20 @@ NEGATIONS = {
     "are not", "were not"
 }
 
-
 # ============================================================
 # TEXT HELPERS
 # ============================================================
 TOKEN_RE = re.compile(r"\b\w+\b", re.UNICODE)
+
+BAD_TEXT_VALUES = {
+    "",
+    "null",
+    "none",
+    "nan",
+    "error fetching article",
+    "<null>",
+    "n/a",
+}
 
 
 def tokenize_words(text: str) -> List[str]:
@@ -220,9 +218,6 @@ def tokenize_words(text: str) -> List[str]:
 
 
 def count_terms(text: str, terms: set) -> int:
-    """
-    Counts single words and multi-word phrases.
-    """
     t = f" {normalize_term(text)} "
     count = 0
     for term in terms:
@@ -239,28 +234,47 @@ def source_key(x: Any) -> str:
     return normalize_term(str(x))
 
 
+def clean_text_value(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in BAD_TEXT_VALUES:
+        return ""
+    return s
+
+
+def is_valid_text(x: Any, min_len: int = 30) -> bool:
+    s = clean_text_value(x)
+    if not s:
+        return False
+    if len(s) < min_len:
+        return False
+    alpha = sum(1 for c in s if c.isalpha())
+    return alpha >= 15
+
+
 # ============================================================
 # SOURCE PRIORS
 # ============================================================
+def detect_col(df: pd.DataFrame, candidates: List[str]) -> str:
+    col_map = {str(col).strip().lower(): col for col in df.columns}
+    for c in candidates:
+        key = str(c).strip().lower()
+        if key in col_map:
+            return col_map[key]
+    raise ValueError(f"None of {candidates} found. Available: {list(df.columns)}")
+
+
 def load_source_bias_map() -> Dict[str, np.ndarray]:
     if not FILE_ALLSIDES_SOURCES.exists():
         return {}
 
     df = pd.read_csv(FILE_ALLSIDES_SOURCES, low_memory=False)
 
-    name_col = None
-    for c in ["name", "source", "media", "outlet"]:
-        if c in df.columns:
-            name_col = c
-            break
-
-    bias_col = None
-    for c in ["bias", "bias_rating", "rating"]:
-        if c in df.columns:
-            bias_col = c
-            break
-
-    if name_col is None or bias_col is None:
+    try:
+        name_col = detect_col(df, ["name", "source", "media", "outlet"])
+        bias_col = detect_col(df, ["bias", "bias_rating", "rating"])
+    except Exception:
         return {}
 
     priors = {}
@@ -734,19 +748,25 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def detect_col(df: pd.DataFrame, candidates: List[str]) -> str:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    raise ValueError(f"None of {candidates} found. Available: {list(df.columns)}")
-
-
 def masked_ce_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
     targets = targets.to(logits.device)
     mask = targets.ne(ignore_index)
     if mask.sum().item() == 0:
         return torch.zeros((), device=logits.device)
     return F.cross_entropy(logits[mask], targets[mask])
+
+
+def masked_ce_loss_weighted(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    targets = targets.to(logits.device)
+    mask = targets.ne(ignore_index)
+    if mask.sum().item() == 0:
+        return torch.zeros((), device=logits.device)
+    return F.cross_entropy(logits[mask], targets[mask], weight=class_weights)
 
 
 def soft_kld_loss(logits: torch.Tensor, soft_targets: torch.Tensor, has_soft: torch.Tensor) -> torch.Tensor:
@@ -761,6 +781,20 @@ def soft_kld_loss(logits: torch.Tensor, soft_targets: torch.Tensor, has_soft: to
     tgt = soft_targets[mask]
     tgt = tgt / tgt.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     return F.kl_div(logp, tgt, reduction="batchmean")
+
+
+def make_class_weights_from_counts(labels: pd.Series, n_classes: int) -> torch.Tensor:
+    counts = labels.value_counts().sort_index()
+    weights = []
+    total = int(len(labels))
+    for i in range(n_classes):
+        c = int(counts.get(i, 1))
+        w = total / (n_classes * c)
+        weights.append(w)
+
+    weights = np.array(weights, dtype=np.float32)
+    weights = np.clip(weights, 0.5, 4.0)
+    return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
 
 
 def compute_tp_tn_fp_fn(y_true: List[int], y_pred: List[int], labels: List[int], names: List[str]) -> Dict[str, Dict[str, int]]:
@@ -794,7 +828,6 @@ def evaluate(model: HierMultiTaskBiasModel, dl: DataLoader) -> Dict[str, Any]:
 
             losses.append(float(loss.item()))
 
-            # leaning with optional source prior adjustment
             logits_lean = out["logits_lean"].detach().float().cpu().numpy()
             for i in range(len(logits_lean)):
                 y = int(batch.y_lean[i].item())
@@ -806,7 +839,6 @@ def evaluate(model: HierMultiTaskBiasModel, dl: DataLoader) -> Dict[str, Any]:
                 all_lean_y.append(y)
                 all_lean_p.append(p)
 
-            # intensity
             yI = batch.y_int.cpu().numpy()
             pI = out["logits_int"].argmax(dim=-1).detach().cpu().numpy()
             m2 = yI != -100
@@ -840,97 +872,143 @@ def evaluate(model: HierMultiTaskBiasModel, dl: DataLoader) -> Dict[str, Any]:
 # ============================================================
 # RAW DATA LOADERS
 # ============================================================
-def load_lean_datasets() -> pd.DataFrame:
-    frames = []
+def load_lean_dataset_from_combined() -> pd.DataFrame:
+    if not FILE_COMBINED_LEAN.exists():
+        raise RuntimeError(
+            f"Combined leaning dataset not found: {FILE_COMBINED_LEAN}\n"
+            f"Create it first."
+        )
 
-    # 1) AllSides balanced headlines/texts
-    if FILE_ALLSIDES_HEADLINES.exists():
-        df = pd.read_csv(FILE_ALLSIDES_HEADLINES, low_memory=False)
+    df = pd.read_csv(FILE_COMBINED_LEAN, low_memory=False)
 
-        title_col = detect_col(df, ["title", "tittle", "heading"])
-        text_col = detect_col(df, ["text", "heading", "title"])
-        source_col = detect_col(df, ["source", "source_name", "name"])
-        label_col = detect_col(df, ["bias_rating", "bias", "label"])
+    text_col = detect_col(df, ["text"])
+    label_col = detect_col(df, ["lean", "bias", "bias_rating"])
+    source_col = None
+    title_col = None
+    link_col = None
 
-        df["lean"] = df[label_col].map(norm_lean)
-        df = df[df["lean"].notna() & df[text_col].notna()].copy()
+    available_cols = {str(c).strip().lower() for c in df.columns}
+    if "source_name" in available_cols:
+        source_col = detect_col(df, ["source_name"])
+    elif "site" in available_cols:
+        source_col = detect_col(df, ["site"])
+    elif "source" in available_cols:
+        source_col = detect_col(df, ["source"])
 
-        df = df.rename(columns={
-            title_col: "title",
-            text_col: "text",
-            source_col: "source_name",
-        })
-        df["dataset_name"] = "allsides_balanced"
-        frames.append(df[["title", "text", "source_name", "lean", "dataset_name"]])
+    if "title" in available_cols:
+        title_col = detect_col(df, ["title"])
+    elif "tittle" in available_cols:
+        title_col = detect_col(df, ["tittle"])
 
-    # 2) Political_Bias.csv
-    for fp, ds_name in [
-        (FILE_POLITICAL_BIAS, "political_bias"),
-        (FILE_POLITICAL_BIAS_UPDATE, "political_bias_update"),
-    ]:
-        if fp.exists():
-            df = pd.read_csv(fp, low_memory=False)
-            title_col = detect_col(df, ["title", "tittle", "heading"])
-            text_col = detect_col(df, ["text", "content", "article"])
-            source_col = detect_col(df, ["source", "source_name", "name"])
-            label_col = detect_col(df, ["bias", "bias_rating", "label"])
+    if "link" in available_cols:
+        link_col = detect_col(df, ["link"])
+    elif "url" in available_cols:
+        link_col = detect_col(df, ["url"])
 
-            df["lean"] = df[label_col].map(norm_lean)
-            df = df[df["lean"].notna() & df[text_col].notna()].copy()
+    df[text_col] = df[text_col].apply(clean_text_value)
+    df["lean"] = df[label_col].map(norm_lean)
 
-            df = df.rename(columns={
-                title_col: "title",
-                text_col: "text",
-                source_col: "source_name",
-            })
-            df["dataset_name"] = ds_name
-            frames.append(df[["title", "text", "source_name", "lean", "dataset_name"]])
+    df = df[
+        df["lean"].notna() &
+        df[text_col].apply(is_valid_text)
+    ].copy()
 
-    if not frames:
-        raise RuntimeError("No leaning datasets found.")
+    df["title"] = df[title_col].fillna("").astype(str) if title_col is not None else ""
+    df["link"] = df[link_col].fillna("").astype(str) if link_col is not None else ""
+    df["source_name"] = df[source_col].fillna("").astype(str) if source_col is not None else ""
+    df["dataset_name"] = df["dataset_name"].fillna("combined_lean_balanced").astype(str) if "dataset_name" in df.columns else "combined_lean_balanced"
 
-    out = pd.concat(frames, ignore_index=True)
-    out["row_id"] = np.arange(len(out))
-    out["y_lean"] = out["lean"].map(LEAN_TO_ID).astype(int)
-    out["y_int"] = -100
-    out["domain"] = DOMAIN_LEAN
-    out["lean_soft"] = None
-    return out
+    # Keep synthetic and real rows if present
+    if "is_synthetic" in df.columns:
+        synth_counts = df["is_synthetic"].value_counts(dropna=False).to_dict()
+        print(f"[combined_lean_dataset_balanced_15000] synthetic flag counts: {synth_counts}")
+
+    df["row_id"] = np.arange(len(df))
+    df["y_lean"] = df["lean"].map(LEAN_TO_ID).astype(int)
+    df["y_int"] = -100
+    df["domain"] = DOMAIN_LEAN
+    df["lean_soft"] = None
+
+    print(f"[combined_lean_dataset_balanced_15000] usable rows: {len(df)}")
+    print(df["lean"].value_counts(dropna=False))
+
+    for i, name in enumerate(LEAN_CANON):
+        cnt = int((df["y_lean"] == i).sum())
+        print(f"  {name}: {cnt}")
+
+    return df[[
+        "row_id", "title", "link", "text", "source_name",
+        "dataset_name", "y_lean", "y_int", "domain", "lean_soft"
+    ]]
 
 
 def load_intensity_dataset() -> pd.DataFrame:
     if not FILE_NEWSMEDIABIAS.exists():
         raise RuntimeError("newsmediabias-full.csv not found.")
 
-    df = pd.read_csv(FILE_NEWSMEDIABIAS, low_memory=False)
+    try:
+        df = pd.read_csv(
+            FILE_NEWSMEDIABIAS,
+            engine="python",
+            on_bad_lines="skip",
+            encoding="utf-8",
+        )
+    except UnicodeDecodeError:
+        df = pd.read_csv(
+            FILE_NEWSMEDIABIAS,
+            engine="python",
+            on_bad_lines="skip",
+            encoding="latin1",
+        )
+
+    print(f"[newsmediabias] loaded raw rows: {len(df)}")
+
     text_col = detect_col(df, ["text"])
     label_col = detect_col(df, ["label", "bias", "bias_rating"])
-    source_col = "source_name" if "source_name" in df.columns else None
 
+    source_col = None
+    available_cols = {str(c).strip().lower() for c in df.columns}
+    for cand in ["source_name", "source", "name"]:
+        if cand in available_cols:
+            source_col = detect_col(df, [cand])
+            break
+
+    df[text_col] = df[text_col].apply(clean_text_value)
     df["intensity"] = df[label_col].map(norm_intensity)
-    df = df[df["intensity"].notna() & df[text_col].notna()].copy()
+
+    df = df[
+        df["intensity"].notna() &
+        df[text_col].apply(is_valid_text)
+    ].copy()
 
     df = df.rename(columns={text_col: "text"})
+
     if source_col is None:
         df["source_name"] = ""
     else:
         df = df.rename(columns={source_col: "source_name"})
 
     df["title"] = ""
+    df["link"] = ""
     df["dataset_name"] = "newsmediabias"
     df["row_id"] = np.arange(len(df))
     df["y_int"] = df["intensity"].map(INT_TO_ID).astype(int)
     df["y_lean"] = -100
     df["domain"] = DOMAIN_INTENSITY
     df["lean_soft"] = None
-    return df[["row_id", "title", "text", "source_name", "dataset_name", "y_lean", "y_int", "domain", "lean_soft"]]
+
+    print(f"[newsmediabias] usable rows: {len(df)}")
+    print(df["intensity"].value_counts(dropna=False))
+
+    return df[[
+        "row_id", "title", "link", "text", "source_name",
+        "dataset_name", "y_lean", "y_int", "domain", "lean_soft"
+    ]]
 
 
 def load_and_prepare_raw() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df_lean = load_lean_datasets()
+    df_lean = load_lean_dataset_from_combined()
     df_int = load_intensity_dataset()
-
-    df_lean = df_lean[["row_id", "title", "text", "source_name", "dataset_name", "y_lean", "y_int", "domain", "lean_soft"]]
     return df_lean, df_int
 
 
@@ -1022,10 +1100,6 @@ def _read_pseudo_cache() -> pd.DataFrame:
 # SOFT LABEL ADJACENT SMOOTHING
 # ============================================================
 def soften_center_adjacent(probs: np.ndarray) -> np.ndarray:
-    """
-    Keeps center but gives more mass to adjacent lean classes when the model is uncertain.
-    This is the safe way to help Left-center / Right-center without forcing the model.
-    """
     p = probs.copy()
 
     idx_center = LEAN_TO_ID["Center"]
@@ -1036,17 +1110,14 @@ def soften_center_adjacent(probs: np.ndarray) -> np.ndarray:
     rc = p[idx_rc]
     lc = p[idx_lc]
 
-    # Ambiguous center vs adjacent right-center
     if center >= 0.30 and rc >= 0.20 and abs(center - rc) <= 0.18:
         p[idx_center] *= 0.90
         p[idx_rc] *= 1.10
 
-    # Ambiguous center vs adjacent left-center
     if center >= 0.30 and lc >= 0.20 and abs(center - lc) <= 0.18:
         p[idx_center] *= 0.90
         p[idx_lc] *= 1.10
 
-    # Small stabilization for extreme classes if adjacent class also has evidence
     idx_r = LEAN_TO_ID["Right"]
     idx_l = LEAN_TO_ID["Left"]
     if p[idx_r] >= 0.25 and p[idx_rc] >= 0.20:
@@ -1067,6 +1138,11 @@ def train_teacher(seed: int, encoder_path: str, use_compile: bool = False) -> st
 
     df_lean, _ = load_and_prepare_raw()
     train_df, val_df, test_df = split_70_15_15(df_lean, "y_lean", seed=seed)
+
+    print("\n[Teacher] train split distribution:")
+    for i, name in enumerate(LEAN_CANON):
+        cnt = int((train_df["y_lean"] == i).sum())
+        print(f"  {name}: {cnt}")
 
     train_ds = StudentTextDataset(train_df)
     val_ds = StudentTextDataset(val_df)
@@ -1099,22 +1175,30 @@ def train_teacher(seed: int, encoder_path: str, use_compile: bool = False) -> st
         num_training_steps=total_updates,
     )
 
-    scaler = GradScaler(enabled=(DEVICE == "cuda"))
+    scaler = make_grad_scaler()
 
-    print("[Teacher] training lean on all lean-labeled datasets...")
+    print("[Teacher] training lean on combined_lean_dataset_balanced_15000.csv ...")
     global_step = 0
 
     for epoch in range(1, EPOCHS_TEACHER + 1):
         model.train()
         opt.zero_grad(set_to_none=True)
 
-        pbar = tqdm(enumerate(train_dl, start=1), total=len(train_dl), dynamic_ncols=True,
-                    desc=f"teacher epoch {epoch}/{EPOCHS_TEACHER}")
+        pbar = tqdm(
+            enumerate(train_dl, start=1),
+            total=len(train_dl),
+            dynamic_ncols=True,
+            desc=f"teacher epoch {epoch}/{EPOCHS_TEACHER}"
+        )
 
         for batch_idx, batch in pbar:
             with torch.autocast(device_type=DEVICE, enabled=USE_AMP, dtype=AMP_DTYPE):
                 out = model(batch, grl_lambda=0.0)
-                loss = masked_ce_loss(out["logits_lean"], batch.y_lean, ignore_index=-100)
+                loss = masked_ce_loss(
+                    out["logits_lean"],
+                    batch.y_lean,
+                    ignore_index=-100,
+                )
                 loss = loss / GRAD_ACCUM
 
             if DEVICE == "cuda":
@@ -1142,8 +1226,14 @@ def train_teacher(seed: int, encoder_path: str, use_compile: bool = False) -> st
         metrics = evaluate(model, val_dl)
         print(f"[Teacher eval][epoch {epoch}] {json.dumps(metrics, indent=2)}")
 
+    test_metrics = evaluate(model, test_dl)
     print("[Teacher] final TEST metrics:")
-    print(json.dumps(evaluate(model, test_dl), indent=2))
+    print(json.dumps(test_metrics, indent=2))
+
+    (OUT_DIR / "teacher_test_metrics.json").write_text(
+        json.dumps(test_metrics, indent=2),
+        encoding="utf-8"
+    )
 
     save_dir = OUT_DIR / "teacher_lean_v3"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1202,6 +1292,7 @@ def pseudo_label_articles(teacher_dir: str, encoder_path: str, infer_batch: int 
     first_write = True
     buffer_rows = []
     flush_every = 20000
+    kept_soft = 0
 
     for item in tqdm(dl, desc="pseudo-label", dynamic_ncols=True):
         row_ids = item["row_id"].cpu().numpy().astype(int).tolist()
@@ -1216,15 +1307,32 @@ def pseudo_label_articles(teacher_dir: str, encoder_path: str, infer_batch: int 
             p = apply_source_prior_if_ambiguous(p, src)
             p = soften_center_adjacent(p)
 
-            keep_soft = float(np.max(p)) >= PSEUDO_MIN_CONF
-            buffer_rows.append({
-                "row_id": rid,
-                "p0": float(p[0]) if keep_soft else np.nan,
-                "p1": float(p[1]) if keep_soft else np.nan,
-                "p2": float(p[2]) if keep_soft else np.nan,
-                "p3": float(p[3]) if keep_soft else np.nan,
-                "p4": float(p[4]) if keep_soft else np.nan,
-            })
+            top_idx = int(np.argmax(p))
+            top_name = LEAN_CANON[top_idx]
+            top_conf = float(np.max(p))
+
+            keep_soft = (top_conf >= PSEUDO_MIN_CONF) and (top_name != "Center")
+            if keep_soft:
+                kept_soft += 1
+                row = {
+                    "row_id": rid,
+                    "p0": float(p[0]),
+                    "p1": float(p[1]),
+                    "p2": float(p[2]),
+                    "p3": float(p[3]),
+                    "p4": float(p[4]),
+                }
+            else:
+                row = {
+                    "row_id": rid,
+                    "p0": np.nan,
+                    "p1": np.nan,
+                    "p2": np.nan,
+                    "p3": np.nan,
+                    "p4": np.nan,
+                }
+
+            buffer_rows.append(row)
 
         if len(buffer_rows) >= flush_every:
             df_chunk = pd.DataFrame(buffer_rows)
@@ -1236,6 +1344,7 @@ def pseudo_label_articles(teacher_dir: str, encoder_path: str, infer_batch: int 
         df_chunk = pd.DataFrame(buffer_rows)
         _write_pseudo_chunk(df_chunk, first_write=first_write)
 
+    print(f"[Pseudo-label] kept soft labels: {kept_soft}/{len(ds)} ({100.0 * kept_soft / max(len(ds), 1):.2f}%)")
     print("[Pseudo-label] done.")
 
 
@@ -1252,6 +1361,10 @@ def build_student_dataframes(seed: int = 42):
         if pd.isna(row["p0"]):
             return None
         probs = [float(row["p0"]), float(row["p1"]), float(row["p2"]), float(row["p3"]), float(row["p4"])]
+        top_idx = int(np.argmax(probs))
+        top_name = LEAN_CANON[top_idx]
+        if top_name == "Center":
+            return None
         return probs
 
     df_int["lean_soft"] = df_int.apply(make_soft, axis=1)
@@ -1260,8 +1373,15 @@ def build_student_dataframes(seed: int = 42):
         if c in df_int.columns:
             df_int.drop(columns=[c], inplace=True)
 
+    n_soft = int(df_int["lean_soft"].notna().sum())
+    n_all = int(len(df_int))
+    print(f"[Student] intensity rows with soft lean labels: {n_soft}/{n_all} ({100.0 * n_soft / max(n_all, 1):.2f}%)")
+
     lean_train, lean_val, lean_test = split_70_15_15(df_lean, "y_lean", seed=seed)
     int_train, int_val, int_test = split_70_15_15(df_int, "y_int", seed=seed)
+
+    print(f"Lean train/val/test: {len(lean_train)} / {len(lean_val)} / {len(lean_test)}")
+    print(f"Intensity train/val/test: {len(int_train)} / {len(int_val)} / {len(int_test)}")
 
     train_df = pd.concat([lean_train, int_train], ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
     val_df = pd.concat([lean_val, int_val], ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
@@ -1309,6 +1429,15 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
     print("[Student] building train/val/test...")
     train_df, val_df, test_df = build_student_dataframes(seed=seed)
 
+    lean_train_only = train_df[train_df["y_lean"] != -100].copy()
+    int_train_only = train_df[train_df["y_int"] != -100].copy()
+
+    lean_class_weights = make_class_weights_from_counts(lean_train_only["y_lean"], len(LEAN_CANON))
+    int_class_weights = make_class_weights_from_counts(int_train_only["y_int"], len(INT_CANON))
+
+    print("[Student] lean class weights:", lean_class_weights.detach().cpu().tolist())
+    print("[Student] int class weights:", int_class_weights.detach().cpu().tolist())
+
     train_ds = StudentTextDataset(train_df)
     val_ds = StudentTextDataset(val_df)
     test_ds = StudentTextDataset(test_df)
@@ -1340,7 +1469,7 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
         num_training_steps=total_updates,
     )
 
-    scaler = GradScaler(enabled=(DEVICE == "cuda"))
+    scaler = make_grad_scaler()
 
     print("[Student] multitask training...")
     update_step = 0
@@ -1349,7 +1478,7 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
     def save_checkpoint():
         torch.save(model.state_dict(), OUT_DIR / "student_checkpoint.pt")
 
-    freeze_first_epoch = True
+    freeze_first_epoch = False
 
     for epoch in range(1, EPOCHS_STUDENT + 1):
         for p in model.encoder.parameters():
@@ -1358,8 +1487,12 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
         model.train()
         opt.zero_grad(set_to_none=True)
 
-        pbar = tqdm(enumerate(train_dl, start=1), total=len(train_dl), dynamic_ncols=True,
-                    desc=f"student epoch {epoch}/{EPOCHS_STUDENT}")
+        pbar = tqdm(
+            enumerate(train_dl, start=1),
+            total=len(train_dl),
+            dynamic_ncols=True,
+            desc=f"student epoch {epoch}/{EPOCHS_STUDENT}"
+        )
 
         for batch_idx, batch in pbar:
             training_start_time = maybe_take_training_break(training_start_time, save_callback=save_checkpoint)
@@ -1370,9 +1503,19 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
             with torch.autocast(device_type=DEVICE, enabled=USE_AMP, dtype=AMP_DTYPE):
                 out = model(batch, grl_lambda=grl_lambda)
 
-                l_lean_hard = masked_ce_loss(out["logits_lean"], batch.y_lean, ignore_index=-100)
+                l_lean_hard = masked_ce_loss_weighted(
+                    out["logits_lean"],
+                    batch.y_lean,
+                    class_weights=lean_class_weights,
+                    ignore_index=-100,
+                )
                 l_lean_soft = soft_kld_loss(out["logits_lean"], batch.lean_soft, batch.has_lean_soft)
-                l_int = masked_ce_loss(out["logits_int"], batch.y_int, ignore_index=-100)
+                l_int = masked_ce_loss_weighted(
+                    out["logits_int"],
+                    batch.y_int,
+                    class_weights=int_class_weights,
+                    ignore_index=-100,
+                )
                 l_dom = F.cross_entropy(out["logits_dom"], batch.domain.to(DEVICE))
 
                 loss = (
@@ -1412,8 +1555,14 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
         metrics = evaluate(model, val_dl)
         print(f"[Student eval][epoch {epoch}] {json.dumps(metrics, indent=2)}")
 
+    test_metrics = evaluate(model, test_dl)
     print("[Student] final TEST metrics:")
-    print(json.dumps(evaluate(model, test_dl), indent=2))
+    print(json.dumps(test_metrics, indent=2))
+
+    (OUT_DIR / "student_test_metrics.json").write_text(
+        json.dumps(test_metrics, indent=2),
+        encoding="utf-8"
+    )
 
     save_dir = OUT_DIR / run_name
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1428,14 +1577,13 @@ def train_student(seed: int, encoder_path: str, run_name: str, use_compile: bool
 
 
 # ============================================================
-# PREDICT
+# PREDICT HELPERS
 # ============================================================
 @torch.no_grad()
-def predict(
+def _predict_from_model(
     text: str,
     model_dir: str,
     encoder_path: str,
-    threshold_non_center: float = 0.5,
     source_name: Optional[str] = None,
 ):
     tok, model = load_model(model_dir, encoder_path)
@@ -1465,6 +1613,26 @@ def predict(
     probs_int = torch.softmax(out["logits_int"], dim=-1).float().squeeze(0).cpu().numpy()
     chunk_attn = out["chunk_attn"].float().squeeze(0).cpu().numpy()
 
+    return {
+        "probs_lean": probs_lean,
+        "probs_int": probs_int,
+        "chunk_attention": chunk_attn.tolist(),
+    }
+
+
+@torch.no_grad()
+def predict(
+    text: str,
+    model_dir: str,
+    encoder_path: str,
+    threshold_non_center: float = 0.5,
+    source_name: Optional[str] = None,
+):
+    raw = _predict_from_model(text, model_dir, encoder_path, source_name=source_name)
+
+    probs_lean = raw["probs_lean"]
+    probs_int = raw["probs_int"]
+
     pred_lean = LEAN_CANON[int(np.argmax(probs_lean))]
     pred_int = INT_CANON[int(np.argmax(probs_int))]
 
@@ -1479,8 +1647,44 @@ def predict(
         "biased_score": float(biased_score),
         "probs_lean": {LEAN_CANON[i]: float(probs_lean[i]) for i in range(5)},
         "probs_int": {INT_CANON[i]: float(probs_int[i]) for i in range(3)},
-        "chunk_attention": chunk_attn.tolist(),
+        "chunk_attention": raw["chunk_attention"],
         "source_used": source_name or None,
+    }
+
+
+@torch.no_grad()
+def predict_combined(
+    text: str,
+    teacher_dir: str,
+    student_dir: str,
+    encoder_path: str,
+    threshold_non_center: float = 0.5,
+    source_name: Optional[str] = None,
+):
+    teacher_raw = _predict_from_model(text, teacher_dir, encoder_path, source_name=source_name)
+    student_raw = _predict_from_model(text, student_dir, encoder_path, source_name=source_name)
+
+    probs_lean = teacher_raw["probs_lean"]
+    probs_int = student_raw["probs_int"]
+
+    pred_lean = LEAN_CANON[int(np.argmax(probs_lean))]
+    pred_int = INT_CANON[int(np.argmax(probs_int))]
+
+    p_center = float(probs_lean[LEAN_TO_ID["Center"]])
+    biased_score = 1.0 - p_center
+    biased = biased_score >= threshold_non_center
+
+    return {
+        "political_bias": pred_lean,
+        "bias_intensity": pred_int,
+        "biased": biased,
+        "biased_score": float(biased_score),
+        "probs_lean": {LEAN_CANON[i]: float(probs_lean[i]) for i in range(5)},
+        "probs_int": {INT_CANON[i]: float(probs_int[i]) for i in range(3)},
+        "chunk_attention_teacher": teacher_raw["chunk_attention"],
+        "chunk_attention_student": student_raw["chunk_attention"],
+        "source_used": source_name or None,
+        "prediction_mode": "combined_teacher_lean_student_intensity",
     }
 
 
@@ -1502,6 +1706,7 @@ def main():
 
     ap.add_argument("--predict", type=str, default=None)
     ap.add_argument("--predict_source", type=str, default=None)
+    ap.add_argument("--predict_mode", type=str, default="combined", choices=["teacher", "student", "combined"])
     ap.add_argument("--threshold", type=float, default=0.5)
 
     args = ap.parse_args()
@@ -1523,7 +1728,7 @@ def main():
 
     if args.pseudo_label_articles:
         if not Path(teacher_dir).exists():
-            raise RuntimeError("Teacher model not found. Run with --train_teacher first.")
+            raise RuntimeError("Teacher model not found. Run --train_teacher first.")
         pseudo_label_articles(
             teacher_dir=teacher_dir,
             encoder_path=encoder_path,
@@ -1545,13 +1750,44 @@ def main():
         )
 
     if args.predict is not None:
+        if args.predict_mode == "teacher":
+            if not Path(teacher_dir).exists():
+                raise RuntimeError("Teacher model not found. Run --train_teacher first.")
+            res = predict(
+                args.predict,
+                model_dir=teacher_dir,
+                encoder_path=encoder_path,
+                threshold_non_center=args.threshold,
+                source_name=args.predict_source,
+            )
+            res["prediction_mode"] = "teacher"
+            print(json.dumps(res, indent=2))
+            return
+
         last = OUT_DIR / "last_student.json"
         if not last.exists():
             raise RuntimeError("No trained student found. Run --train_student first.")
         student_dir = json.loads(last.read_text(encoding="utf-8"))["student_dir"]
-        res = predict(
+
+        if args.predict_mode == "student":
+            res = predict(
+                args.predict,
+                model_dir=student_dir,
+                encoder_path=encoder_path,
+                threshold_non_center=args.threshold,
+                source_name=args.predict_source,
+            )
+            res["prediction_mode"] = "student"
+            print(json.dumps(res, indent=2))
+            return
+
+        if not Path(teacher_dir).exists():
+            raise RuntimeError("Teacher model not found. Run --train_teacher first.")
+
+        res = predict_combined(
             args.predict,
-            model_dir=student_dir,
+            teacher_dir=teacher_dir,
+            student_dir=student_dir,
             encoder_path=encoder_path,
             threshold_non_center=args.threshold,
             source_name=args.predict_source,
