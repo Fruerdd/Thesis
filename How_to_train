@@ -28,9 +28,14 @@ TEST datasets use:
 
 python eval_political_bias_local.py --csv "data_test/political_bias.csv" --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" --encoder "bert-base-uncased" --max_length 128 --max_chunks 3 --batch_size 32 --out_png "political_bias_confusion_matrix.png"
 python batch_eval_datasets.py --datasets_root "DataSets" --model_dir "./bias_system_v2/student_mt_softlean_seed42" --out_dir "batch_outputs" --limit 100
-
 python batch_eval_datasets.py --datasets_root "DataSets" --model_dir "./bias_system_v2/student_mt_softlean_seed42" --encoder "bert-base-uncased" --out_dir "batch_outputs" --max_length 128 --max_chunks 3 --batch_size 16 --threshold 0.5
 
+python eval_lean_external.py --csv "data\your_dataset.csv" --mode combined --encoder bert-base-uncased --teacher_dir ".\bias_system_v3\teacher_lean_v3" --student_dir ".\bias_system_v3\student_mt_softlean_v3_seed42" --out_json "external_eval_metrics.json" --out_png "external_confusion_matrix.png"
+
+
+1) python eval_lean_external.py --csv "data_test/news_bias.csv" --mode combined --batch_size 32 --out_json "news_bias_eval.json" --out_png "news_bias_cm.png" --out_png_norm "news_bias_cm_norm.png" --out_preds "news_bias_predictions.csv"
+2) python eval_lean_external.py --csv "data_test/news_bias.csv" --mode combined --batch_size 32 --out_json "news_bias_eval.json" --out_png "news_bias_cm.png" --out_png_norm "news_bias_cm_norm.png" --out_preds "news_bias_predictions.csv"
+3) python eval_lean_external_3class.py --csv "data_test/news_bias.csv" --mode combined --batch_size 32 --out_json "news_bias_eval_3class.json" --out_png "news_bias_cm_3class.png" --out_png_norm "news_bias_cm_3class_norm.png" --out_preds "news_bias_predictions_3class.csv"
 Advanced training on centered political bias
 
 python finetune_lean_lrll.py \
