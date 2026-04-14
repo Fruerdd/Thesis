@@ -79,7 +79,7 @@ INFER_BATCH = 64 if DEVICE == "cuda" else 16
 NUM_WORKERS = 0
 
 EPOCHS_TEACHER = 2
-EPOCHS_STUDENT = 2
+EPOCHS_STUDENT = 1
 
 LR = 2e-5
 WARMUP_RATIO = 0.06
@@ -155,6 +155,7 @@ def norm_intensity(x: Any) -> Optional[str]:
 
 def normalize_term(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
+
 
 
 HEDGES = {
@@ -831,7 +832,17 @@ def load_lean_dataset_from_combined() -> pd.DataFrame:
 
     df["row_id"] = np.arange(len(df))
     df["y_lean"] = df["lean"].map(LEAN_TO_ID).astype(int)
-    df["y_int"] = -100
+    # Derive intensity from lean: extreme lean → Highly Biased, moderate → Slightly Biased, center → Neutral.
+    # This ensures the intensity head trains on article-length text (same distribution as inference),
+    # not only on the 13-word social-media snippets from newsmediabias.
+    _LEAN_TO_INT = {
+        LEAN_TO_ID["Right"]:        INT_TO_ID["Highly Biased"],
+        LEAN_TO_ID["Left"]:         INT_TO_ID["Highly Biased"],
+        LEAN_TO_ID["Right-center"]: INT_TO_ID["Slightly Biased"],
+        LEAN_TO_ID["Left-center"]:  INT_TO_ID["Slightly Biased"],
+        LEAN_TO_ID["Center"]:       INT_TO_ID["Neutral"],
+    }
+    df["y_int"] = df["y_lean"].map(_LEAN_TO_INT).astype(int)
     df["domain"] = DOMAIN_LEAN
     df["lean_soft"] = None
 

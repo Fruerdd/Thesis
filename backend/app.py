@@ -9,6 +9,8 @@ from backend.models import ArticleAnalysis
 from backend.schema import AnalyzeRequest, AnalyzeResponse
 from backend.extract import extract_from_url
 from backend.infer import predict_text
+from typing import Optional
+from fastapi import Query
 
 LEAN_CANON = ["Right", "Right-center", "Center", "Left-center", "Left"]
 INT_CANON  = ["Highly Biased", "Neutral", "Slightly Biased"]
@@ -91,6 +93,7 @@ def analyze(req: AnalyzeRequest, db: Session = Depends(get_db)):
             model_dir=settings.model_dir,
             encoder_name=settings.encoder_name,
             threshold=req.threshold,
+            source_name=req.source,
         )
 
     duration_ms = int((time.time() - t0) * 1000)
@@ -146,3 +149,58 @@ def analyze(req: AnalyzeRequest, db: Session = Depends(get_db)):
         prediction=row.prediction,
         duration_ms=row.duration_ms,
     )
+
+@app.get("/analyses")
+def list_analyses(
+    domain: Optional[str] = Query(None),       # "headline" | "article"
+    source: Optional[str] = Query(None),
+    min_confidence: float = Query(0.0, ge=0.0, le=1.0),
+    limit: int = Query(500, le=2000),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ArticleAnalysis).filter(
+        ArticleAnalysis.political_bias.isnot(None),
+        ArticleAnalysis.bias_intensity.isnot(None),
+    )
+    if domain:
+        q = q.filter(ArticleAnalysis.input_type == domain)
+    if source:
+        q = q.filter(ArticleAnalysis.source_name == source)
+    if min_confidence > 0:
+        q = q.filter(ArticleAnalysis.biased_score >= min_confidence)
+
+    rows = q.order_by(ArticleAnalysis.analyzed_at.desc()).limit(limit).all()
+
+    result = []
+    for r in rows:
+        pred = r.prediction or {}
+        probs_lean = pred.get("probs_lean") or {}
+        probs_int  = pred.get("probs_int") or {}
+        lean       = r.political_bias or "Center"
+        intensity  = r.bias_intensity or "Neutral"
+
+        result.append({
+            "id":                  r.id,
+            "text":                (r.title or r.used_text or "")[:200],
+            "domain":              "headline" if r.input_type == "text" else "article",
+            "source":              r.source_name,
+            "lean":                lean,
+            "leanConfidence":      float(probs_lean.get(lean, 0.0)),
+            "intensity":           intensity,
+            "intensityConfidence": float(probs_int.get(intensity, 0.0)),
+            "confidence":          float(r.biased_score or 0.0),
+            "chunkAttention":      pred.get("chunk_attention") or [],
+        })
+
+    return result
+
+
+@app.get("/sources")
+def list_sources(db: Session = Depends(get_db)):
+    rows = (
+        db.query(ArticleAnalysis.source_name)
+        .filter(ArticleAnalysis.political_bias.isnot(None))
+        .distinct()
+        .all()
+    )
+    return sorted(r.source_name for r in rows)

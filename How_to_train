@@ -1,43 +1,43 @@
-ROC curve creation:
-python roc_eval.py \
-  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
-  --encoder "bert-base-uncased" \
-  --split both
+# How To Train And Use The Project
 
-python roc_eval.py \
-  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
-  --encoder "bert-base-uncased" \
-  --split train
+This file is a quick runbook for the main training, evaluation, and inference flows in this repository.
 
+## `v2` Training Sequence
 
-V2 SEQUENCE OF COMMANDS
+Run the multitask teacher-student pipeline in this order:
 
-1) python train_bias_v2.py --train_teacher
-2) python train_bias_v2.py --pseudo_label_articles
-3) python train_bias_v2.py --train_student
+```bash
+python train_bias_v2.py --train_teacher
+python train_bias_v2.py --pseudo_label_articles
+python train_bias_v2.py --train_student
+```
 
-V3 SEQUENCE OF COMMANDS
+## `v3` Training Sequence
 
-1) python train_bias_v3.py --train_teacher --encoder bert-base-uncased
-2) python train_bias_v3.py --clear_pseudo_cache
-3) python train_bias_v3.py --pseudo_label_articles --encoder bert-base-uncased
-4) python train_bias_v3.py --train_student --encoder bert-base-uncased
-5) python train_bias_v3.py --predict "Your article text here" --predict_mode combined --predict_source "CNN" --encoder bert-base-uncased
+Run the newer leaning-focused pipeline in this order:
 
-TEST datasets use:
+```bash
+python train_bias_v3.py --train_teacher --encoder bert-base-uncased
+python train_bias_v3.py --clear_pseudo_cache
+python train_bias_v3.py --pseudo_label_articles --encoder bert-base-uncased
+python train_bias_v3.py --train_student --encoder bert-base-uncased
+```
 
-python eval_political_bias_local.py --csv "data_test/political_bias.csv" --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" --encoder "bert-base-uncased" --max_length 128 --max_chunks 3 --batch_size 32 --out_png "political_bias_confusion_matrix.png"
-python batch_eval_datasets.py --datasets_root "DataSets" --model_dir "./bias_system_v2/student_mt_softlean_seed42" --out_dir "batch_outputs" --limit 100
-python batch_eval_datasets.py --datasets_root "DataSets" --model_dir "./bias_system_v2/student_mt_softlean_seed42" --encoder "bert-base-uncased" --out_dir "batch_outputs" --max_length 128 --max_chunks 3 --batch_size 16 --threshold 0.5
+Example direct prediction with `v3`:
 
-python eval_lean_external.py --csv "data\your_dataset.csv" --mode combined --encoder bert-base-uncased --teacher_dir ".\bias_system_v3\teacher_lean_v3" --student_dir ".\bias_system_v3\student_mt_softlean_v3_seed42" --out_json "external_eval_metrics.json" --out_png "external_confusion_matrix.png"
+```bash
+python train_bias_v3.py \
+  --predict "Your article text here" \
+  --predict_mode combined \
+  --predict_source "CNN" \
+  --encoder bert-base-uncased
+```
 
+## Advanced Lean Fine-Tuning
 
-1) python eval_lean_external.py --csv "data_test/news_bias.csv" --mode combined --batch_size 32 --out_json "news_bias_eval.json" --out_png "news_bias_cm.png" --out_png_norm "news_bias_cm_norm.png" --out_preds "news_bias_predictions.csv"
-2) python eval_lean_external.py --csv "data_test/news_bias.csv" --mode combined --batch_size 32 --out_json "news_bias_eval.json" --out_png "news_bias_cm.png" --out_png_norm "news_bias_cm_norm.png" --out_preds "news_bias_predictions.csv"
-3) python eval_lean_external_3class.py --csv "data_test/news_bias.csv" --mode combined --batch_size 32 --out_json "news_bias_eval_3class.json" --out_png "news_bias_cm_3class.png" --out_png_norm "news_bias_cm_3class_norm.png" --out_preds "news_bias_predictions_3class.csv"
-Advanced training on centered political bias
+Use this to further improve leaning performance on centered political bias data:
 
+```bash
 python finetune_lean_lrll.py \
   --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
   --encoder "bert-base-uncased" \
@@ -48,12 +48,135 @@ python finetune_lean_lrll.py \
   --max_chunks 3 \
   --replay_size 12000 \
   --lrll_repeat 4
+```
 
-HOW TO USE:
+## Evaluation
 
+### ROC Curves
 
-Advanced model use:
+```bash
+python roc_eval.py \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --split both
 
+python roc_eval.py \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --split train
+```
+
+### Balanced 5-Class Holdout Evaluation
+
+Teacher:
+
+```bash
+python eval_new_5class_dataset.py \
+  --csv "data_prepared/combined_lean_real_holdout_5class_100_each.csv" \
+  --mode teacher \
+  --batch_size 32 \
+  --out_json "real_holdout_eval_teacher.json" \
+  --out_png "real_holdout_cm_teacher.png" \
+  --out_png_norm "real_holdout_cm_teacher_norm.png" \
+  --out_preds "real_holdout_preds_teacher.csv"
+```
+
+Student:
+
+```bash
+python eval_new_5class_dataset.py \
+  --csv "data_prepared/combined_lean_real_holdout_5class_100_each.csv" \
+  --mode student \
+  --batch_size 32 \
+  --out_json "real_holdout_eval_student.json" \
+  --out_png "real_holdout_cm_student.png" \
+  --out_png_norm "real_holdout_cm_student_norm.png" \
+  --out_preds "real_holdout_preds_student.csv"
+```
+
+### Local Political Bias Evaluation
+
+```bash
+python eval_political_bias_local.py \
+  --csv "data_test/political_bias.csv" \
+  --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" \
+  --encoder "bert-base-uncased" \
+  --max_length 128 \
+  --max_chunks 3 \
+  --batch_size 32 \
+  --out_png "political_bias_confusion_matrix.png"
+```
+
+### External 5-Class Evaluation
+
+Generic external dataset:
+
+```bash
+python eval_lean_external.py \
+  --csv "data/your_dataset.csv" \
+  --mode combined \
+  --encoder bert-base-uncased \
+  --teacher_dir "./bias_system_v3/teacher_lean_v3" \
+  --student_dir "./bias_system_v3/student_mt_softlean_v3_seed42" \
+  --out_json "external_eval_metrics.json" \
+  --out_png "external_confusion_matrix.png"
+```
+
+Example:
+
+```bash
+python eval_lean_external.py \
+  --csv "data_test/news_bias.csv" \
+  --mode combined \
+  --batch_size 32 \
+  --out_json "news_bias_eval.json" \
+  --out_png "news_bias_cm.png" \
+  --out_png_norm "news_bias_cm_norm.png" \
+  --out_preds "news_bias_predictions.csv"
+```
+
+### External 3-Class Evaluation
+
+```bash
+python eval_lean_external_3class.py \
+  --csv "data_test/news_bias.csv" \
+  --mode combined \
+  --batch_size 32 \
+  --out_json "news_bias_eval_3class.json" \
+  --out_png "news_bias_cm_3class.png" \
+  --out_png_norm "news_bias_cm_3class_norm.png" \
+  --out_preds "news_bias_predictions_3class.csv"
+```
+
+### Batch Evaluation On JSON Folders
+
+Quick limited run:
+
+```bash
+python batch_eval_datasets.py \
+  --datasets_root "DataSets" \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --out_dir "batch_outputs" \
+  --limit 100
+```
+
+Full configured run:
+
+```bash
+python batch_eval_datasets.py \
+  --datasets_root "DataSets" \
+  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --encoder "bert-base-uncased" \
+  --out_dir "batch_outputs" \
+  --max_length 128 \
+  --max_chunks 3 \
+  --batch_size 16 \
+  --threshold 0.5
+```
+
+Advanced model batch use:
+
+```bash
 python test_json_folders.py \
   --datasets_root "DataSets" \
   --model_dir "./bias_system_v2/student_finetuned_lrll" \
@@ -62,28 +185,41 @@ python test_json_folders.py \
   --max_length 192 \
   --max_chunks 3 \
   --batch_size 16
+```
 
+## Analyze And Store Results In PostgreSQL
 
-General model:
+### Analyze Plain Text
 
-1) Analyze plain text
+```bash
 python analyze_cli.py \
   --db "postgresql+psycopg2://user:pass@localhost:5432/biasdb" \
   --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
   --encoder "bert-base-uncased" \
   --source "BBC" \
   --text "Your article text here..."
+```
 
-2) Analyze URL
+### Analyze URL
+
+```bash
 python analyze_cli.py \
   --db "postgresql+psycopg2://user:pass@localhost:5432/biasdb" \
   --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
   --encoder "bert-base-uncased" \
   --source "BBC" \
   --url "https://example.com/news/article"
+```
 
+Example DB reference:
+
+```text
 DB_URL = jdbc:postgresql://localhost:5432/thesis
+```
 
+Example text analysis against local PostgreSQL:
+
+```bash
 python analyze_cli.py \
   --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
   --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
@@ -106,11 +242,15 @@ Unlike his wife, former President Bill Clinton has several documented trips and 
 It was before Epstein was under federal investigation for sex trafficking and Clinton says he regrets his association with him and never knew of his crimes at the time.
 
 Democrats say they will ask Clinton hard questions, but that the wrong president is giving evidence today."
+```
 
+Example URL analysis against local PostgreSQL:
+
+```bash
 python analyze_cli.py \
   --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
   --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
   --encoder "bert-base-uncased" \
   --source "Time" \
   --url "https://time.com/7382464/trump-starmer-conflict-uk-us-relationship-iran-war/"
-
+```

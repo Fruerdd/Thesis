@@ -4,8 +4,7 @@ from functools import lru_cache
 
 # We reuse your existing model code (predict function) from train_bias_v2.py
 # IMPORTANT: make sure your train_bias_v2.py predict() already does `.float()` before `.numpy()`.
-from train_bias_v2 import predict as core_predict  # type: ignore
-
+from train_bias_v3 import predict as core_predict  # type: ignore
 
 @lru_cache(maxsize=1)
 def get_device() -> str:
@@ -22,6 +21,7 @@ def predict_text(
     model_dir: str,
     encoder_name: str,
     threshold: float,
+    source_name: str | None = None,
 ) -> dict:
     """
     Safe wrapper around your predict() to ensure JSON serializable outputs
@@ -32,6 +32,7 @@ def predict_text(
         model_dir=model_dir,
         encoder_path=encoder_name,
         threshold_non_center=threshold,
+        source_name=source_name,
     )
 
     # Force-safe types (no numpy scalars)
