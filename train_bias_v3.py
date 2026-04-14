@@ -92,6 +92,11 @@ W_DOMAIN = 0.0
 DOMAIN_LEAN = 0
 DOMAIN_INTENSITY = 1
 
+# Cap newsmediabias (sentence-level) per intensity class so it doesn't drown out
+# the article-level intensity signal derived from the lean dataset (74.5 K rows).
+# 15 000 per class ≈ 45 K sentences, vs ~74 K articles → roughly 40/60 split.
+NEWSMEDIABIAS_MAX_PER_CLASS = 15_000
+
 PSEUDO_MIN_CONF = 0.55
 SOURCE_PRIOR_ALPHA = 0.10
 SOURCE_PRIOR_MARGIN = 0.06
@@ -889,6 +894,16 @@ def load_intensity_dataset() -> pd.DataFrame:
     else:
         df = df.rename(columns={source_col: "source_name"})
 
+    # Cap per class so 3.4 M sentence-level rows don't overwhelm the 74.5 K
+    # article-level intensity labels derived from the lean dataset.
+    df = (
+        df.groupby("intensity", group_keys=False)
+        .apply(lambda g: g.sample(min(len(g), NEWSMEDIABIAS_MAX_PER_CLASS), random_state=42))
+        .reset_index(drop=True)
+    )
+    print(f"[newsmediabias] after per-class cap ({NEWSMEDIABIAS_MAX_PER_CLASS}/class):")
+    print(df["intensity"].value_counts(dropna=False))
+
     df["title"] = ""
     df["link"] = ""
     df["dataset_name"] = "newsmediabias"
@@ -899,7 +914,6 @@ def load_intensity_dataset() -> pd.DataFrame:
     df["lean_soft"] = None
 
     print(f"[newsmediabias] usable rows: {len(df)}")
-    print(df["intensity"].value_counts(dropna=False))
 
     return df[[
         "row_id", "title", "link", "text", "source_name",
