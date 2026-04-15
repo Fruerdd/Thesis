@@ -64,6 +64,7 @@ PREP_DIR = Path("data_prepared")
 
 FILE_COMBINED_LEAN = PREP_DIR / "combined_lean_train_without_holdout.csv"
 FILE_NEWSMEDIABIAS = DATA_DIR / "newsmediabias-full.csv"
+FILE_DEBIASED_INTENSITY = DATA_DIR / "debiased_profainty_check_with_keywords.csv"
 FILE_ALLSIDES_SOURCES = DATA_DIR / "allsides.csv"
 
 OUT_DIR = Path("./bias_system_v3")
@@ -872,56 +873,29 @@ def load_lean_dataset_from_combined() -> pd.DataFrame:
 
 
 def load_intensity_dataset() -> pd.DataFrame:
-    if not FILE_NEWSMEDIABIAS.exists():
-        raise RuntimeError("newsmediabias-full.csv not found.")
+    if not FILE_DEBIASED_INTENSITY.exists():
+        raise RuntimeError(f"Intensity dataset not found: {FILE_DEBIASED_INTENSITY}")
 
-    try:
-        df = pd.read_csv(FILE_NEWSMEDIABIAS, engine="python", on_bad_lines="skip", encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(FILE_NEWSMEDIABIAS, engine="python", on_bad_lines="skip", encoding="latin1")
+    df = pd.read_csv(FILE_DEBIASED_INTENSITY, low_memory=False)
+    print(f"[debiased_intensity] loaded raw rows: {len(df)}")
 
-    print(f"[newsmediabias] loaded raw rows: {len(df)}")
+    df["text"] = df["biased_text"].apply(clean_text_value)
+    df["intensity"] = df["bias_label"].map(norm_intensity)
 
-    text_col = detect_col(df, ["text"])
-    label_col = detect_col(df, ["label", "bias", "bias_rating"])
+    df = df[df["intensity"].notna() & df["text"].apply(is_valid_text)].copy()
 
-    source_col = None
-    available_cols = {str(c).strip().lower() for c in df.columns}
-    for cand in ["source_name", "source", "name"]:
-        if cand in available_cols:
-            source_col = detect_col(df, [cand])
-            break
-
-    df[text_col] = df[text_col].apply(clean_text_value)
-    df["intensity"] = df[label_col].map(norm_intensity)
-    df = df[df["intensity"].notna() & df[text_col].apply(is_valid_text)].copy()
-    df = df.rename(columns={text_col: "text"})
-
-    if source_col is None:
-        df["source_name"] = ""
-    else:
-        df = df.rename(columns={source_col: "source_name"})
-
-    # Cap per class so 3.4 M sentence-level rows don't overwhelm the 74.5 K
-    # article-level intensity labels derived from the lean dataset.
-    df = (
-        df.groupby("intensity", group_keys=False)
-        .apply(lambda g: g.sample(min(len(g), NEWSMEDIABIAS_MAX_PER_CLASS), random_state=42))
-        .reset_index(drop=True)
-    )
-    print(f"[newsmediabias] after per-class cap ({NEWSMEDIABIAS_MAX_PER_CLASS}/class):")
-    print(df["intensity"].value_counts(dropna=False))
-
+    df["source_name"] = ""
     df["title"] = ""
     df["link"] = ""
-    df["dataset_name"] = "newsmediabias"
+    df["dataset_name"] = "debiased_intensity"
     df["row_id"] = np.arange(len(df))
     df["y_int"] = df["intensity"].map(INT_TO_ID).astype(int)
     df["y_lean"] = -100
     df["domain"] = DOMAIN_INTENSITY
     df["lean_soft"] = None
 
-    print(f"[newsmediabias] usable rows: {len(df)}")
+    print(f"[debiased_intensity] usable rows: {len(df)}")
+    print(df["intensity"].value_counts(dropna=False))
 
     return df[[
         "row_id", "title", "link", "text", "source_name",
