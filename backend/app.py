@@ -179,10 +179,19 @@ def list_analyses(
         lean       = r.political_bias or "Center"
         intensity  = r.bias_intensity or "Neutral"
 
+        used = r.used_text or ""
+        word_count = len(used.split())
+        if r.input_type == "url":
+            domain = "article"
+        elif word_count >= 30:
+            domain = "article"
+        else:
+            domain = "headline"
+
         result.append({
             "id":                  r.id,
-            "text":                (r.title or r.used_text or "")[:200],
-            "domain":              "headline" if r.input_type == "text" else "article",
+            "text":                (r.title or used or "")[:200],
+            "domain":              domain,
             "source":              r.source_name,
             "lean":                lean,
             "leanConfidence":      float(probs_lean.get(lean, 0.0)),

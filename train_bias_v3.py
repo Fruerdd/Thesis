@@ -1461,22 +1461,11 @@ def predict(
     probs_int = raw["probs_int"]
 
     pred_lean = LEAN_CANON[int(np.argmax(probs_lean))]
+    pred_int  = INT_CANON[int(np.argmax(probs_int))]
 
     p_center = float(probs_lean[LEAN_TO_ID["Center"]])
     biased_score = 1.0 - p_center
     biased = biased_score >= threshold_non_center
-
-    # Intensity derived from biased_score (calibrated on the real holdout set).
-    # The trained intensity head and lean-label mapping both fail on OOD articles
-    # because the lean model rarely assigns probability to moderate classes on
-    # unseen sources.  biased_score separates Center (median 0.43) from biased
-    # articles reliably and produces a realistic 17/33/50 Neutral/Slight/High split.
-    if biased_score < INTENSITY_THRESH_NEUTRAL:
-        pred_int = "Neutral"
-    elif biased_score < INTENSITY_THRESH_SLIGHTLY:
-        pred_int = "Slightly Biased"
-    else:
-        pred_int = "Highly Biased"
 
     return {
         "political_bias": pred_lean,
@@ -1506,16 +1495,11 @@ def predict_combined(
     probs_int = student_raw["probs_int"]
 
     pred_lean = LEAN_CANON[int(np.argmax(probs_lean))]
+    pred_int  = INT_CANON[int(np.argmax(student_raw["probs_int"]))]
+
     p_center = float(probs_lean[LEAN_TO_ID["Center"]])
     biased_score = 1.0 - p_center
     biased = biased_score >= threshold_non_center
-
-    if biased_score < INTENSITY_THRESH_NEUTRAL:
-        pred_int = "Neutral"
-    elif biased_score < INTENSITY_THRESH_SLIGHTLY:
-        pred_int = "Slightly Biased"
-    else:
-        pred_int = "Highly Biased"
 
     return {
         "political_bias": pred_lean,
