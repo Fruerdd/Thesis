@@ -189,26 +189,25 @@ python test_json_folders.py \
 
 ### Bias Intensity Evaluation
 
-Evaluates intensity prediction accuracy (confusion matrix + F1) against two ground-truth sources:
-- **Article holdout** – `data_prepared/combined_lean_real_holdout_5class_100_each.csv`, ground truth derived from lean label (Right/Left → Highly Biased, Right-center/Left-center → Slightly Biased, Center → Neutral)
-- **Sentence dataset** – `data/debiased_profainty_check_with_keywords.csv`, real `bias_label` column
+Evaluates intensity prediction accuracy (confusion matrix + F1) against
+`data/debiased_profainty_check_with_keywords.csv` — the only dataset with
+real content-level intensity labels (Neutral / Slightly Biased / Highly Biased).
 
-Both datasets, default model (student):
+> **Note:** The article holdout set is intentionally NOT used here. Its lean
+> labels are source-level (e.g. Fox News → "Right"), so a Fox News article
+> about dog rescues would get a "Slightly Biased" derived label, which is
+> meaningless as an intensity ground truth.
+
+Default run (500 rows per class, student model):
 
 ```bash
 python eval_intensity.py
 ```
 
-Articles only (fast, 500 rows):
+All rows:
 
 ```bash
-python eval_intensity.py --dataset articles
-```
-
-Sentences only, all rows:
-
-```bash
-python eval_intensity.py --dataset sentences --sentence_max_per_class 0
+python eval_intensity.py --max_per_class 0
 ```
 
 Different model or custom paths:
@@ -217,7 +216,6 @@ Different model or custom paths:
 python eval_intensity.py \
   --model_dir "./bias_system_v3/teacher_lean_v3" \
   --encoder bert-base-uncased \
-  --dataset both \
   --out_dir "intensity_eval_outputs"
 ```
 
@@ -225,15 +223,10 @@ Outputs saved to `intensity_eval_outputs/`:
 
 | File | Contents |
 |---|---|
-| `cm_article_holdout.png` | Confusion matrix (counts) for articles |
-| `cm_article_holdout_norm.png` | Normalised confusion matrix for articles |
-| `metrics_article_holdout.json` | Accuracy, macro F1, per-class P/R/F1 for articles |
-| `cm_sentence_dataset.png` / `_norm.png` | Same for sentence dataset |
-| `all_metrics.json` | Both datasets combined |
-
-> **Intensity thresholds** (calibrated on the real holdout set) are defined as constants
-> in `train_bias_v3.py`: `INTENSITY_THRESH_NEUTRAL = 0.50` and `INTENSITY_THRESH_SLIGHTLY = 0.97`.
-> Adjust these to shift the Neutral / Slightly Biased / Highly Biased split.
+| `cm_intensity_eval.png` | Confusion matrix (counts) |
+| `cm_intensity_eval_norm.png` | Normalised confusion matrix |
+| `metrics_intensity_eval.json` | Accuracy, macro F1, per-class P/R/F1 |
+| `all_metrics.json` | Full metrics dict |
 
 ### Evaluate 100-Per-Class Test Set And Store To Database
 
@@ -271,8 +264,8 @@ ORDER BY 1, 2;
 
 ```bash
 python analyze_cli.py \
-  --db "postgresql+psycopg2://user:pass@localhost:5432/biasdb" \
-  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --db "postgresql+psycopg2://user:pass@localhost:5432/thesis" \
+  --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" \
   --encoder "bert-base-uncased" \
   --source "BBC" \
   --text "Your article text here..."
@@ -282,53 +275,42 @@ python analyze_cli.py \
 
 ```bash
 python analyze_cli.py \
-  --db "postgresql+psycopg2://user:pass@localhost:5432/biasdb" \
-  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --db "postgresql+psycopg2://user:pass@localhost:5432/thesis" \
+  --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" \
   --encoder "bert-base-uncased" \
   --source "BBC" \
   --url "https://example.com/news/article"
 ```
 
-Example DB reference:
-
-```text
-DB_URL = jdbc:postgresql://localhost:5432/thesis
-```
-
-Example text analysis against local PostgreSQL:
+Local PostgreSQL example (text):
 
 ```bash
 python analyze_cli.py \
   --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
-  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
-  --encoder "bert-base-uncased" \
-  --source "BBC" \
-  --text "The political temperature is really heating up on day two of these depositions.
-
-Before the start, we heard from both Republicans and Democrats on the committee and their description of the former Secretary of State Hillary Clinton’s demeanour and credibility couldn’t have been more different.
-
-Republican representative Nancy Mace claimed Clinton was unhinged at one point in the deposition.
-
-But Democrats, in disbelief, said that was beyond a mischaracterisation.
-
-The public will be able to decide for themselves when the video is eventually made public.
-
-Today’s deposition is expected to be far more tense and to last a lot longer.
-
-Unlike his wife, former President Bill Clinton has several documented trips and interactions with Epstein when he was trying to set up his charitable work post presidency.
-
-It was before Epstein was under federal investigation for sex trafficking and Clinton says he regrets his association with him and never knew of his crimes at the time.
-
-Democrats say they will ask Clinton hard questions, but that the wrong president is giving evidence today."
-```
-
-Example URL analysis against local PostgreSQL:
-
-```bash
-python analyze_cli.py \
-  --db "postgresql+psycopg2://fruerd:fruerd@localhost:5432/thesis" \
-  --model_dir "./bias_system_v2/student_mt_softlean_seed42" \
+  --model_dir "./bias_system_v3/student_mt_softlean_v3_seed42" \
   --encoder "bert-base-uncased" \
   --source "Time" \
   --url "https://time.com/7382464/trump-starmer-conflict-uk-us-relationship-iran-war/"
+```
+
+## Deploying / Moving To Another Machine
+
+Moving `bias_system_v3/` alone is not enough. You also need:
+
+| What | Where |
+|---|---|
+| `bias_system_v3/` | Model weights + tokenizer — copy this folder |
+| `bert-base-uncased` HuggingFace cache | `~/.cache/huggingface/hub/models--bert-base-uncased/` |
+| `train_bias_v3.py` | Inference code |
+| Python dependencies | `pip install -r requirements-backend.txt` |
+
+Copy the HuggingFace cache to avoid re-downloading (~440 MB):
+
+```bash
+# on source machine
+cp -r ~/.cache/huggingface/hub/models--bert-base-uncased/ /transfer/
+
+# on target machine
+mkdir -p ~/.cache/huggingface/hub/
+cp -r /transfer/models--bert-base-uncased/ ~/.cache/huggingface/hub/
 ```
