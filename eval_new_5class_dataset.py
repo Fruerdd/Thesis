@@ -94,8 +94,13 @@ def plot_confusion_matrix(
     else:
         cm_plot = cm
 
+    from matplotlib.colors import LinearSegmentedColormap
+    light_blues = LinearSegmentedColormap.from_list(
+        "light_blues", plt.cm.Blues(np.linspace(0.05, 0.65, 256))
+    )
+
     fig, ax = plt.subplots(figsize=(9, 7))
-    im = ax.imshow(cm_plot, interpolation="nearest")
+    im = ax.imshow(cm_plot, interpolation="nearest", cmap=light_blues)
     plt.colorbar(im, ax=ax)
 
     ax.set(
@@ -109,7 +114,6 @@ def plot_confusion_matrix(
     )
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
 
-    threshold = cm_plot.max() / 2.0 if cm_plot.size else 0.0
     for i in range(cm_plot.shape[0]):
         for j in range(cm_plot.shape[1]):
             value = cm_plot[i, j]
@@ -120,7 +124,7 @@ def plot_confusion_matrix(
                 text_value,
                 ha="center",
                 va="center",
-                color="white" if value > threshold else "black",
+                color="black",
             )
 
     fig.tight_layout()

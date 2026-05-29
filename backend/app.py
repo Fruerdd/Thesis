@@ -155,7 +155,7 @@ def list_analyses(
     domain: Optional[str] = Query(None),       # "headline" | "article"
     source: Optional[str] = Query(None),
     min_confidence: float = Query(0.0, ge=0.0, le=1.0),
-    limit: int = Query(500, le=2000),
+    limit: Optional[int] = Query(None),
     db: Session = Depends(get_db),
 ):
     q = db.query(ArticleAnalysis).filter(
@@ -169,7 +169,10 @@ def list_analyses(
     if min_confidence > 0:
         q = q.filter(ArticleAnalysis.biased_score >= min_confidence)
 
-    rows = q.order_by(ArticleAnalysis.analyzed_at.desc()).limit(limit).all()
+    q = q.order_by(ArticleAnalysis.analyzed_at.desc())
+    if limit is not None:
+        q = q.limit(limit)
+    rows = q.all()
 
     result = []
     for r in rows:
@@ -193,6 +196,7 @@ def list_analyses(
             "text":                (r.title or used or "")[:200],
             "domain":              domain,
             "source":              r.source_name,
+            "sourceType":          "external_synthetic" if r.source_name == "external_synthetic" else "real",
             "lean":                lean,
             "leanConfidence":      float(probs_lean.get(lean, 0.0)),
             "intensity":           intensity,

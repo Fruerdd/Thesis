@@ -1,388 +1,233 @@
-import re
+"""
+Merge four raw lean-labeled CSVs in data/ into a single combined training file.
+
+Inputs (column schemas are now known and used directly):
+  data/Political_Bias.csv                          [Title, Link, Text, Source, Bias]
+  data/Political_Bias_Update.csv                   [Title, Link, Text, Source, Bias]
+  data/allsides_balanced_news_headlines-texts.csv  [title, heading, source, text, bias_rating]
+  data/bias_clean.csv                              [url, topic, date, title, site, bias, page_text]
+
+Output:
+  data_prepared/combined_lean_dataset_v2.csv
+  data_prepared/combined_lean_dataset_v2_stats.json
+"""
+
 import json
+import re
 from pathlib import Path
-from typing import Any, List, Optional, Dict
 
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-# ============================================================
-# PATHS
-# ============================================================
 DATA_DIR = Path("data")
-
-FILE_ALLSIDES_HEADLINES = DATA_DIR / "allsides_balanced_news_headlines-texts.csv"
-FILE_POLITICAL_BIAS = DATA_DIR / "Political_Bias.csv"
-FILE_POLITICAL_BIAS_UPDATE = DATA_DIR / "Political_Bias_Update.csv"
-FILE_BIAS_CLEAN = DATA_DIR / "bias_clean.csv"
-
 OUT_DIR = Path("data_prepared")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 OUT_CSV = OUT_DIR / "combined_lean_dataset_v2.csv"
-OUT_STATS_JSON = OUT_DIR / "combined_lean_dataset_v2_stats.json"
+OUT_STATS = OUT_DIR / "combined_lean_dataset_v2_stats.json"
 
-# ============================================================
-# CONFIG
-# ============================================================
-SIMILARITY_THRESHOLD = 0.90
+SIMILARITY_THRESHOLD = 0.80
 MIN_TEXT_LEN = 30
 MIN_ALPHA_CHARS = 15
 
 LEAN_CANON = ["Right", "Right-center", "Center", "Left-center", "Left"]
 
-BAD_TEXT_VALUES = {
-    "",
-    "null",
-    "none",
-    "nan",
-    "error fetching article",
-    "<null>",
-    "n/a",
+LEAN_MAP = {
+    "right": "Right",
+    "conservative": "Right",
+    "lean right": "Right-center",
+    "leaning-right": "Right-center",
+    "right-center": "Right-center",
+    "center-right": "Right-center",
+    "center": "Center",
+    "neutral": "Center",
+    "centrist": "Center",
+    "lean left": "Left-center",
+    "leaning-left": "Left-center",
+    "left-center": "Left-center",
+    "center-left": "Left-center",
+    "left": "Left",
+    "liberal": "Left",
 }
 
-# ============================================================
-# HELPERS
-# ============================================================
-def detect_col(df: pd.DataFrame, candidates: List[str]) -> str:
-    col_map = {str(col).strip().lower(): col for col in df.columns}
-    for c in candidates:
-        key = str(c).strip().lower()
-        if key in col_map:
-            return col_map[key]
-    raise ValueError(f"None of {candidates} found. Available: {list(df.columns)}")
+BAD_TEXT = {"", "null", "none", "nan", "n/a", "<null>", "error fetching article"}
 
 
-def norm_lean(x: Any) -> Optional[str]:
+def norm_lean(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
-
-    s = str(x).strip().lower()
-
-    if s in {"right", "conservative"}:
-        return "Right"
-    if s in {"lean right", "right-center", "right center", "center-right", "centerright"}:
-        return "Right-center"
-    if s in {"center", "neutral", "centrist"}:
-        return "Center"
-    if s in {"lean left", "left-center", "left center", "center-left", "centerleft"}:
-        return "Left-center"
-    if s in {"left", "liberal"}:
-        return "Left"
-
-    return None
+    return LEAN_MAP.get(str(x).strip().lower())
 
 
-def clean_text_value(x: Any) -> str:
+def clean_text(x):
     if x is None:
         return ""
     s = str(x).strip()
-    if s.lower() in BAD_TEXT_VALUES:
-        return ""
-    return s
+    return "" if s.lower() in BAD_TEXT else s
 
 
-def is_valid_text(x: Any) -> bool:
-    s = clean_text_value(x)
-    if not s:
+def is_valid_text(s):
+    if not s or len(s) < MIN_TEXT_LEN:
         return False
-    if len(s) < MIN_TEXT_LEN:
-        return False
-    alpha = sum(1 for c in s if c.isalpha())
-    return alpha >= MIN_ALPHA_CHARS
+    return sum(1 for c in s if c.isalpha()) >= MIN_ALPHA_CHARS
 
 
-def normalize_text_for_dedupe(text: str) -> str:
-    text = clean_text_value(text).lower()
-    text = re.sub(r"http\S+", " ", text)
-    text = re.sub(r"www\.\S+", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def normalize_text_for_dedupe(text):
+    t = clean_text(text).lower()
+    t = re.sub(r"http\S+|www\.\S+", " ", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
-def word_count(text: str) -> int:
-    return len(re.findall(r"\b\w+\b", str(text).lower()))
+def word_count(text):
+    return len(re.findall(r"\b\w+\b", str(text)))
 
 
 # ============================================================
-# DATA LOADERS
+# LOADERS — one per raw file, using known column names directly
 # ============================================================
-def load_allsides() -> pd.DataFrame:
-    if not FILE_ALLSIDES_HEADLINES.exists():
-        raise FileNotFoundError(f"Missing file: {FILE_ALLSIDES_HEADLINES}")
-
-    df = pd.read_csv(FILE_ALLSIDES_HEADLINES, low_memory=False)
-
-    title_col = detect_col(df, ["title", "tittle", "heading"])
-    text_col = detect_col(df, ["text", "heading", "title"])
-    source_col = detect_col(df, ["source", "source_name", "name"])
-    label_col = detect_col(df, ["bias_rating", "bias", "label"])
-
-    df["text"] = df[text_col].apply(clean_text_value)
-    df["lean"] = df[label_col].map(norm_lean)
-
-    df = df[
-        df["lean"].notna() &
-        df["text"].apply(is_valid_text)
-    ].copy()
-
-    df["title"] = df[title_col].fillna("").astype(str)
-    df["link"] = ""
-    df["topic"] = ""
-    df["date"] = ""
-    df["source_name"] = df[source_col].fillna("").astype(str)
-    df["dataset_name"] = "allsides_balanced"
-
-    return df[[
-        "title", "link", "topic", "date", "source_name",
-        "text", "lean", "dataset_name"
-    ]]
-
-
-def load_political_bias_file(path: Path, dataset_name: str) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing file: {path}")
-
+def load_political_bias(path: Path, dataset_name: str) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
+    return pd.DataFrame({
+        "title": df["Title"].fillna("").astype(str),
+        "link": df["Link"].fillna("").astype(str),
+        "topic": "",
+        "date": "",
+        "source_name": df["Source"].fillna("").astype(str),
+        "text": df["Text"].apply(clean_text),
+        "lean": df["Bias"].map(norm_lean),
+        "dataset_name": dataset_name,
+    })
 
-    title_col = detect_col(df, ["title"])
-    link_col = detect_col(df, ["link"])
-    text_col = detect_col(df, ["text"])
-    source_col = detect_col(df, ["source"])
-    label_col = detect_col(df, ["bias", "bias_rating"])
 
-    df["text"] = df[text_col].apply(clean_text_value)
-    df["lean"] = df[label_col].map(norm_lean)
-
-    df = df[
-        df["lean"].notna() &
-        df["text"].apply(is_valid_text)
-    ].copy()
-
-    df["title"] = df[title_col].fillna("").astype(str)
-    df["link"] = df[link_col].fillna("").astype(str)
-    df["topic"] = ""
-    df["date"] = ""
-    df["source_name"] = df[source_col].fillna("").astype(str)
-    df["dataset_name"] = dataset_name
-
-    return df[[
-        "title", "link", "topic", "date", "source_name",
-        "text", "lean", "dataset_name"
-    ]]
+def load_allsides() -> pd.DataFrame:
+    df = pd.read_csv(DATA_DIR / "allsides_balanced_news_headlines-texts.csv", low_memory=False)
+    return pd.DataFrame({
+        "title": df["title"].fillna("").astype(str),
+        "link": "",
+        "topic": "",
+        "date": "",
+        "source_name": df["source"].fillna("").astype(str),
+        "text": df["text"].apply(clean_text),
+        "lean": df["bias_rating"].map(norm_lean),
+        "dataset_name": "allsides_balanced",
+    })
 
 
 def load_bias_clean() -> pd.DataFrame:
-    if not FILE_BIAS_CLEAN.exists():
-        raise FileNotFoundError(f"Missing file: {FILE_BIAS_CLEAN}")
-
-    df = pd.read_csv(FILE_BIAS_CLEAN, low_memory=False)
-
-    url_col = detect_col(df, ["url"])
-    topic_col = detect_col(df, ["topic"])
-    date_col = detect_col(df, ["date"])
-    title_col = detect_col(df, ["title", "tittle"])
-    site_col = detect_col(df, ["site", "source", "source_name", "name"])
-    bias_col = detect_col(df, ["bias", "bias_rating"])
-    text_col = detect_col(df, ["page_text", "text"])
-
-    df["text"] = df[text_col].apply(clean_text_value)
-    df["lean"] = df[bias_col].map(norm_lean)
-
-    df = df[
-        df["lean"].notna() &
-        df["text"].apply(is_valid_text)
-    ].copy()
-
-    df["title"] = df[title_col].fillna("").astype(str)
-    df["link"] = df[url_col].fillna("").astype(str)
-    df["topic"] = df[topic_col].fillna("").astype(str)
-    df["date"] = df[date_col].fillna("").astype(str)
-    df["source_name"] = df[site_col].fillna("").astype(str)
-    df["dataset_name"] = "bias_clean"
-
-    return df[[
-        "title", "link", "topic", "date", "source_name",
-        "text", "lean", "dataset_name"
-    ]]
+    df = pd.read_csv(DATA_DIR / "bias_clean.csv", low_memory=False)
+    return pd.DataFrame({
+        "title": df["title"].fillna("").astype(str),
+        "link": df["url"].fillna("").astype(str),
+        "topic": df["topic"].fillna("").astype(str),
+        "date": df["date"].fillna("").astype(str),
+        "source_name": df["site"].fillna("").astype(str),
+        "text": df["page_text"].apply(clean_text),
+        "lean": df["bias"].map(norm_lean),
+        "dataset_name": "bias_clean",
+    })
 
 
 # ============================================================
-# PRIORITY + DEDUPE
+# DEDUPLICATION
 # ============================================================
-def add_priority(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Keep rarer classes first during near-deduplication.
-    Then keep longer texts first.
-    """
-    counts = df["lean"].value_counts().to_dict()
-    df = df.copy()
-    df["class_count"] = df["lean"].map(counts).astype(int)
-    df["text_words"] = df["text"].apply(word_count)
-
-    df = df.sort_values(
-        by=["class_count", "text_words"],
-        ascending=[True, False]
-    ).reset_index(drop=True)
-
-    return df
-
-
 def exact_dedupe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["text_norm"] = df["text"].apply(normalize_text_for_dedupe)
-    df = df[df["text_norm"] != ""].copy()
-    df = df.drop_duplicates(subset=["text_norm"], keep="first").reset_index(drop=True)
-    return df
+    df = df[df["text_norm"] != ""]
+    return df.drop_duplicates(subset=["text_norm"], keep="first").reset_index(drop=True)
 
 
-def build_block_key(text_norm: str) -> str:
-    words = text_norm.split()
-    first_words = " ".join(words[:8]) if words else ""
-    length_bucket = len(words) // 50
-    return f"{first_words}__{length_bucket}"
-
-
-def near_dedupe_with_tfidf(df: pd.DataFrame, threshold: float = 0.80) -> pd.DataFrame:
+def near_dedupe_with_tfidf(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     """
-    Approximate near-duplicate removal:
-    - block by first 8 normalized words + length bucket
-    - inside each block, use char-ngram TF-IDF cosine similarity
-    - greedily keep first row, drop later rows if sim >= threshold
+    Block by (first 8 normalized words + length bucket), then char-ngram
+    TF-IDF cosine inside each block. Keep first row in each near-duplicate
+    cluster.
     """
     df = df.copy()
-    df["block_key"] = df["text_norm"].apply(build_block_key)
+    df["block_key"] = df["text_norm"].apply(
+        lambda t: " ".join(t.split()[:8]) + f"__{len(t.split()) // 50}"
+    )
 
-    keep_indices = []
-
+    keep = []
     for _, block in df.groupby("block_key", sort=False):
         block = block.reset_index(drop=False)
-        texts = block["text_norm"].tolist()
-
         if len(block) == 1:
-            keep_indices.append(int(block.loc[0, "index"]))
+            keep.append(int(block.loc[0, "index"]))
             continue
 
         vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-        X = vectorizer.fit_transform(texts)
+        X = vectorizer.fit_transform(block["text_norm"].tolist())
 
-        kept_local = []
-        dropped_local = set()
-
+        dropped = set()
         for i in range(X.shape[0]):
-            if i in dropped_local:
+            if i in dropped:
                 continue
-
-            kept_local.append(i)
-
+            keep.append(int(block.loc[i, "index"]))
             sims = (X[i] @ X[i + 1:].T).toarray().ravel()
             for rel_j, sim in enumerate(sims, start=i + 1):
                 if sim >= threshold:
-                    dropped_local.add(rel_j)
+                    dropped.add(rel_j)
 
-        keep_indices.extend(block.loc[kept_local, "index"].tolist())
-
-    out = df.loc[sorted(set(keep_indices))].copy().reset_index(drop=True)
-    return out
+    return df.loc[sorted(set(keep))].reset_index(drop=True)
 
 
 # ============================================================
 # STATS
 # ============================================================
-def summarize(df: pd.DataFrame) -> Dict[str, Any]:
-    rows_per_lean = {}
-    words_per_lean = {}
-
-    for lean in LEAN_CANON:
-        part = df[df["lean"] == lean]
-        rows_per_lean[lean] = int(len(part))
-        words_per_lean[lean] = int(part["text"].apply(word_count).sum())
-
+def summarize(df: pd.DataFrame) -> dict:
     return {
         "total_rows": int(len(df)),
-        "rows_per_lean": rows_per_lean,
-        "words_per_lean": words_per_lean,
+        "rows_per_lean": {
+            lean: int((df["lean"] == lean).sum()) for lean in LEAN_CANON
+        },
+        "words_per_lean": {
+            lean: int(df.loc[df["lean"] == lean, "text"].apply(word_count).sum())
+            for lean in LEAN_CANON
+        },
     }
-
-
-def print_summary(stats: Dict[str, Any]) -> None:
-    print("\n=== FINAL DATASET SUMMARY ===")
-    print(f"Total rows: {stats['total_rows']}")
-
-    print("\nRows per political leaning:")
-    for lean, cnt in stats["rows_per_lean"].items():
-        print(f"  {lean}: {cnt}")
-
-    print("\nTotal words per political leaning:")
-    for lean, cnt in stats["words_per_lean"].items():
-        print(f"  {lean}: {cnt}")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    print("Loading datasets...")
+    frames = [
+        load_political_bias(DATA_DIR / "Political_Bias.csv", "political_bias"),
+        load_political_bias(DATA_DIR / "Political_Bias_Update.csv", "political_bias_update"),
+        load_allsides(),
+        load_bias_clean(),
+    ]
 
-    df_a = load_allsides()
-    df_b = load_political_bias_file(FILE_POLITICAL_BIAS, "political_bias")
-    df_c = load_political_bias_file(FILE_POLITICAL_BIAS_UPDATE, "political_bias_update")
-    df_d = load_bias_clean()
+    df = pd.concat(frames, ignore_index=True)
 
-    print(f"[allsides_balanced] usable rows: {len(df_a)}")
-    print(df_a["lean"].value_counts())
+    df = df[df["lean"].notna() & df["text"].apply(is_valid_text)].reset_index(drop=True)
+    print(f"[after label+text filter] rows: {len(df)}")
+    print(df["lean"].value_counts())
 
-    print(f"\n[political_bias] usable rows: {len(df_b)}")
-    print(df_b["lean"].value_counts())
-
-    print(f"\n[political_bias_update] usable rows: {len(df_c)}")
-    print(df_c["lean"].value_counts())
-
-    print(f"\n[bias_clean] usable rows: {len(df_d)}")
-    print(df_d["lean"].value_counts())
-
-    df = pd.concat([df_a, df_b, df_c, df_d], ignore_index=True)
-    print(f"\n[combined before dedupe] rows: {len(df)}")
-
-    df = add_priority(df)
-
-    # exact duplicates
     df = exact_dedupe(df)
-    print(f"[after exact text dedupe] rows: {len(df)}")
+    print(f"[after exact dedupe] rows: {len(df)}")
 
-    # near duplicates
     df = near_dedupe_with_tfidf(df, threshold=SIMILARITY_THRESHOLD)
-    print(f"[after near-duplicate dedupe @ {SIMILARITY_THRESHOLD:.2f}] rows: {len(df)}")
+    print(f"[after near-dedupe @ {SIMILARITY_THRESHOLD:.2f}] rows: {len(df)}")
 
-    # final cleanup columns
     df["row_id"] = np.arange(len(df))
     df["word_count"] = df["text"].apply(word_count)
 
-    final_cols = [
-        "row_id",
-        "title",
-        "link",
-        "topic",
-        "date",
-        "source_name",
-        "text",
-        "lean",
-        "dataset_name",
-        "word_count",
-    ]
-    df = df[final_cols].reset_index(drop=True)
+    df = df[[
+        "row_id", "title", "link", "topic", "date", "source_name",
+        "text", "lean", "dataset_name", "word_count",
+    ]]
 
     stats = summarize(df)
-    print_summary(stats)
-
     df.to_csv(OUT_CSV, index=False, encoding="utf-8")
-    OUT_STATS_JSON.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    OUT_STATS.write_text(json.dumps(stats, indent=2), encoding="utf-8")
 
-    print(f"\nSaved dataset to: {OUT_CSV}")
-    print(f"Saved stats to: {OUT_STATS_JSON}")
+    print(f"\nFinal: {stats['total_rows']} rows")
+    for lean, n in stats["rows_per_lean"].items():
+        print(f"  {lean}: {n}")
+    print(f"\nSaved: {OUT_CSV}")
 
 
 if __name__ == "__main__":
