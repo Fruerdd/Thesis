@@ -1,0 +1,4 @@
+{
+  "seed": 42,
+  "encoder_path": "bert-base-uncased"
+}
