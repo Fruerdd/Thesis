@@ -1,4 +1,4 @@
-# Thesis1: Political Bias Detection for News Articles
+# Thesis: Political Bias Detection for News Articles
 
 This repository contains a thesis project for detecting political bias in news content. It includes training pipelines, dataset preparation utilities, evaluation scripts, inference utilities, PostgreSQL-backed storage, and a FastAPI backend for serving predictions.
 
